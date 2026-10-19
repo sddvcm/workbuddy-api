@@ -8,7 +8,13 @@
 // 用法：node ui-static-check.mjs
 import { readFileSync } from "node:fs";
 
-const raw = readFileSync(new URL("../cmd/workbuddy-api/web/app.js", import.meta.url), "utf8");
+// readLF 读取文本并统一成 LF 行尾。
+// 为什么需要：仓库 core.autocrlf=true，Windows 工作区里 app.js/index.html/style.css
+// 都是 CRLF，而本脚本的正则（如 `\\{\\n  display: grid;`）按 LF 写 ——
+// 不归一化的话，Windows 上跑必定误报（实测「平台表列宽动态化」就是这么挂的）。
+const readLF = (url) => readFileSync(url, "utf8").replace(/\r\n/g, "\n");
+
+const raw = readLF(new URL("../cmd/workbuddy-api/web/app.js", import.meta.url));
 
 // 把 `let state = null;` 改成假数据，并暴露待测函数（app.js 是脚本，函数是顶层声明）。
 const FAKE_STATE = {
@@ -244,7 +250,7 @@ check("重新登录入口的 title 点明缺 refresh_token 场景",
 // 抓到的死按钮就是这个。这条断言把「卡片 ⟳ → startLogin → 分派到 OfficeAce 专属入口」
 // 这段接线锁住（真正的端到端对齐在 Go 侧 TestReloginChannelSetMatchesBackend）。
 {
-  const appSrc = readFileSync(new URL("../cmd/workbuddy-api/web/app.js", import.meta.url), "utf8");
+  const appSrc = readLF(new URL("../cmd/workbuddy-api/web/app.js", import.meta.url));
   check("startLogin 对 officeace 分派到专属入口（防死按钮复发）",
     /if \(channel === "officeace"\) return startOfficeAceWebLogin\(\);/.test(appSrc));
   check("OfficeAce 专属入口打的是 officeace_auto 端点（而非 /api/login/start）",
@@ -353,7 +359,7 @@ check("非 officeace 账号不带「缺续期凭据」（渠道限定，避免�
   check("展开选择持久化到 localStorage", raw.includes("localStorage.setItem(SHOW_NA_KEY"));
   check("全部被收起时给出可执行提示（不留空白页）",
     /id="acctHiddenTip"/.test(
-      readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8"))
+      readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url)))
     && raw.includes('$("acctHiddenTip")'));
 
   // 复原，避免影响后续场景的汇总条断言。
@@ -480,7 +486,7 @@ const FAKE_STATS = {
 };
 
 T.renderStats(FAKE_STATS);
-const htmlEarly = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
+const htmlEarly = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
 check("汇总横条已删（容器与渲染函数都不存在，信息由合计行承接）",
   !raw.includes("function stSumItem") && !raw.includes('$("stSum")') && !/id="stSum"/.test(htmlEarly));
 check("合计行消耗列带精确小注（承接旧汇总条唯一独有信息）",
@@ -601,7 +607,7 @@ globalThis.__DedupT([{ id: "2026-10-06-m1", title: "里程碑", body: "100分" }
 check("里程碑 toast 同 id 去重（只写一次已读标记）", toastWrites === 1, `实际写入 ${toastWrites} 次`);
 
 // ---- 静态结构断言：index.html / style.css 的 stats 骨架 ----
-const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
+const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
 check('第三个 tab 按钮存在（data-mtab="stats"）', /data-mtab="stats"/.test(html));
 check("#mtabStats body 存在且默认隐藏", /class="mtab-body hidden" id="mtabStats"/.test(html));
 check("运行统计区块骨架存在（stPlat/stApplog）", /id="stPlat"/.test(html) && /id="stApplog"/.test(html));
@@ -611,7 +617,7 @@ check('第四个 tab 按钮存在（data-mtab="fees"）', /data-mtab="fees"/.tes
 check("#mtabFees body 存在且默认隐藏", /class="mtab-body hidden" id="mtabFees"/.test(html));
 check("模型费率区块骨架存在（feesBox/btnRefreshFees）", /id="feesBox"/.test(html) && /id="btnRefreshFees"/.test(html));
 check("模型费率区块在 section 内（不再是独立 section）", /<div class="mtab-body hidden" id="mtabFees">[\s\S]*?<\/section>/.test(html) && !/<!-- 模型列表和费率 -->\s*<section class="panel">/.test(html));
-const css = readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8");
+const css = readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url));
 check("style.css 含运行统计样式段（#mtabStats .st-plat-row 等）", /#mtabStats \.st-token/.test(css) && /#mtabStats \.st-plat-row/.test(css));
 // ---- Token 多天行单行：不许回退成 wrap（wrap 会在内容长度临界时抖动换行）----
 check("Token 多天行 st-token 单行不折行（nowrap，极窄整条截尾）",
@@ -725,8 +731,8 @@ for (const [label, re] of uniq) {
 // 漏了不报错，只表现为「渠道能选到但没入口」或「弹层弹出来但点没反应」——
 // 与 R34/R41 同族的「声明了却没接线」，故在此静态锁住。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
+  const css = readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url));
   const need = [
     ["index.html 有 Cline 添加按钮", html.includes('id="btnAddCline"')],
     ["index.html 有 API Key 粘贴弹层", html.includes('id="clineOverlay"')],
@@ -848,8 +854,8 @@ for (const [label, re] of uniq) {
 // 与 R34/R41 同族：这两处都是「改了交互/样式但没接线/被后写规则覆盖」就静默失效，
 // 且宽度断点一旦被人调大就会重新弄坏桌面端（本次就是靠像素级 diff 才发现过一次），故在此锁死。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
+  const css = readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url));
   const need = [
     // 积分明细：点击式。hover 版在「浮窗开着时后台 loadState() 重建卡片 DOM」会让
     // mouseleave 不再派发，浮窗永久残留（用户反馈的「经常不能自动关闭」），触屏更是关不掉。
@@ -894,7 +900,7 @@ for (const [label, re] of uniq) {
 // 与 R34/R41 同族：「后端有端点、面板没接线」不报错不崩溃，只表现为
 // 配不了降级链 / 配了不生效，故把接线与渲染一并锁死。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
   T.renderFallbacks([
     { from: "workbuddyai/deepseek-v4.1-flash", to: "workbuddy/glm-5.2", at: "09:12:03", at_unix: 1760000000, active: true },
     { from: "oczen/big-pickle", to: "workbuddy/glm-free", at: "08:01:00", at_unix: 1759990000, recovered: "08:05:12", dur_sec: 252, active: false },
@@ -928,7 +934,7 @@ for (const [label, re] of uniq) {
 // 与降级链同族：「后端有端点、面板没接线」不报错不崩溃，只表现为配不了
 // 档位 / 配了不生效，故把编辑区、建议集与接线一并锁死。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
   const need = [
     ["设置弹层有思考强度编辑区（全局默认行 + 映射列表 + 输入行）",
       html.includes('id="effGlobalInput"') && html.includes('id="effList"') && html.includes('id="effModelInput"') && html.includes('id="effEffortInput"') && html.includes('id="btnEffAdd"') && html.includes('id="btnEffSave"')],
@@ -954,7 +960,7 @@ for (const [label, re] of uniq) {
     ["renderEffList 模型 ID 列可伸缩不被定宽压掉",
       /class="fb-map-model" title=/.test(raw)
       && /\.fb-map-card \.fb-map-model \{[^}]*flex: 1 1 200px/.test(
-        readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8"))],
+        readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url)))],
   ];
   for (const [label, pass] of need) {
     console.log(`  ${pass ? "✅" : "❌"} ${label}`);
@@ -965,8 +971,8 @@ for (const [label, re] of uniq) {
 // ---- 设置弹层内的模型查找入口（模型降级链 / 思考强度标题右侧）----
 // 与 R34/R41 同族：「按钮存在但没接线」不报错，只表现为点了没反应，故静态锁住。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
+  const css = readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url));
   const need = [
     ["两处 cfg-heading 各带一个 data-model-search 查找按钮",
       (html.match(/data-model-search/g) || []).length === 2],
@@ -993,8 +999,8 @@ for (const [label, re] of uniq) {
 
 // ---- 自定义渠道（R66）：设置面板接线与样式 ----
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
+  const css = readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url));
   const need = [
     ["自定义模型是独立弹层（R85：设置里只留一个入口按钮）",
       html.includes('id="customModelsOverlay"') && html.includes('id="customChList"') &&
@@ -1035,7 +1041,10 @@ for (const [label, re] of uniq) {
     // 不报错到日志、静态检查也全绿，属 R34/R41 家族的「声明了却没接线」。
     // 例外：creditTip 由 JS 动态创建（见 newCreditTip），故白名单放行。
     (() => {
-      const dyn = new Set(["creditTip"]);
+      // 动态生成的 id（renderFees / 结果面板 innerHTML 产出，index.html 里本来就没有）：
+      // feeSearch/btnShowAllModels 由 renderFees 每次重建；btnTaskClose/btnCompClose
+      // 由结果面板渲染。均以事件委托绑定，不会被重建打断。
+      const dyn = new Set(["creditTip", "feeSearch", "btnShowAllModels", "btnTaskClose", "btnCompClose"]);
       const ids = new Set([...html.matchAll(/id="([A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
       const missing = [...new Set([...raw.matchAll(/\$\("([A-Za-z0-9_-]+)"\)/g)].map((m) => m[1]))]
         .filter((id) => !ids.has(id) && !dyn.has(id));
@@ -1063,7 +1072,7 @@ for (const [label, re] of uniq) {
 // admin_password 却看不到登录弹层、点任何按钮无反应，而 JS/后端全都正常（零报错零崩溃）。
 // 与 R34/R41 同族「声明了却没接线」，只是这次是 HTML 结构层面的静默失效，故静态锁住。
 {
-  const html = readFileSync(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url), "utf8");
+  const html = readLF(new URL("../cmd/workbuddy-api/web/index.html", import.meta.url));
   const opens = (html.match(/<div\b/g) || []).length;
   const closes = (html.match(/<\/div>/g) || []).length;
   // 从任一 overlay 起点按花括号/标签配平找到它的匹配 </div>（返回闭合处的下标，找不到返回 -1）。
@@ -1228,7 +1237,7 @@ for (const [label, re] of uniq) {
   check3("空明细提示函数存在（renderCreditTipNotice）", /function renderCreditTipNotice\(/.test(raw));
   check3("showCreditDetail 空 items 分支也给出提示（不再静默）",
     /if \(!d \|\| !d\.items \|\| !d\.items\.length\) \{\s*renderCreditTipNotice\(/.test(raw));
-  check3(".detail-empty 有样式（提示条可读）", readFileSync(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url), "utf8").includes(".credit-tip .detail-empty"));
+  check3(".detail-empty 有样式（提示条可读）", readLF(new URL("../cmd/workbuddy-api/web/style.css", import.meta.url)).includes(".credit-tip .detail-empty"));
 
   for (const [label, pass, extra] of need3) {
     console.log(`  ${pass ? "✅" : "❌"} ${label}${!pass && extra ? `  ← ${extra}` : ""}`);
@@ -1386,7 +1395,7 @@ for (const [label, re] of uniq) {
   // R83：停用功能整体移除（前端按钮 + 后端 enabled 字段）
   check5("自定义渠道不再有停用按钮", !raw.includes('data-toggle-custom'));
   check5("后端 ChannelConfig 不再有 Enabled 字段",
-    !readFileSync(new URL("../internal/custom/config.go", import.meta.url), "utf8").includes("Enabled *bool"));
+    !readLF(new URL("../internal/custom/config.go", import.meta.url)).includes("Enabled *bool"));
   check5("Provider 行有编辑入口", /data-edit-custom=/.test(raw));
   check5("三个新弹层都存在（渠道编辑/模型管理/模型编辑）",
     ['channelEditorOverlay', 'modelManagerOverlay', 'modelEditorOverlay'].every((id) => html.includes(`id="${id}"`)));
@@ -1670,7 +1679,7 @@ for (const [label, re] of uniq) {
     // 1) 前端保留名 vs 后端 BuiltinKinds()：前端漏一个 → 不拦同名、后端才报错。
     const reservedSrc = raw.match(/const RESERVED_CHANNEL_NAMES = new Set\(\[([\s\S]*?)\]\)/);
     const reserved = reservedSrc ? new Function("return [" + reservedSrc[1] + "]")() : [];
-    const goKinds = [...readFileSync(new URL("../internal/provider/provider.go", import.meta.url), "utf8")
+    const goKinds = [...readLF(new URL("../internal/provider/provider.go", import.meta.url))
       .matchAll(/^\t[A-Za-z]+\s+Kind = "([a-z]+)"/gm)].map((m) => m[1]);
     const missingReserved = goKinds.filter((k) => !reserved.includes(k));
     checkPal("前端 RESERVED_CHANNEL_NAMES 覆盖全部内建渠道（与 provider.BuiltinKinds 同集）",

@@ -1479,6 +1479,21 @@ function renderFees(fees) {
   }
   const active = renderFees.lastCh;
 
+  // 搜索态判定：**必须提到两个循环之外**。曾写在第一个 for 里，第二个循环的
+  // `if (!searching && unpriced > 0)` 直接 ReferenceError —— 只要任一渠道模型数为 0
+  // （无账号/拉取失败都会这样），整个费率 tab 就白屏，控制台只有一行不起眼的报错。
+  const searching = !!feeQuery();
+
+  // 工具行：模型搜索框 + 「显示隐藏模型」开关。
+  // 这两个控件曾在上游前端整体替换时连同绑定一起丢失（JS 里的引用还在，
+  // 但 DOM 与事件都没有 ⇒ 功能静默消失，静态检查的悬空 id 检测专门盯这个）。
+  // 渲染在 renderFees 内部（而非 index.html）：整个费率区都是这里生成的。
+  html += `<div class="fees-tools">
+    <input id="feeSearch" class="input" type="search" placeholder="搜索模型 / 渠道 / 完整 ID"
+           value="${esc(feeQuery())}" autocomplete="off">
+    <button id="btnShowAllModels" class="btn small" type="button"></button>
+  </div>`;
+
   html += `<div class="fees-tabs">`;
   for (const ch of channels) {
     // tab 上的数字必须与表里**实际行数**同口径，否则用户按数字核对会以为漏了模型。
@@ -1488,7 +1503,6 @@ function renderFees(fees) {
     //   默认态  → 仅上游给了倍率的模型数
     // 早期版本搜索态仍显示默认态计数（搜出 2 行却标 20），看着像「模型清单不全」。
     const all = ch.models || [];
-    const searching = !!feeQuery();
     const n = searching
       ? all.filter((m) => m && feeMatch(ch.channel, m)).length
       : all.filter((m) => m && (m.priced || showAllModels())).length;
@@ -1505,6 +1519,9 @@ function renderFees(fees) {
 
   for (const ch of channels) {
     const models = ch.models || [];
+    // 本渠道「上游未给倍率」的模型数。曾整个变量缺失（只在注释里被引用），
+    // 一进费率 tab 就 ReferenceError 白屏；语义见下方两段 note 文案。
+    const unpriced = models.filter((m) => m && !m.priced).length;
     const hidden = ch.channel !== active ? ' class="hidden"' : '';
     html += `<div class="fees-panel${hidden ? ' hidden' : ''}" data-feepanel="${esc(ch.channel)}">`;
     if (models.length === 0) {
@@ -1634,6 +1651,10 @@ function applyFeeSearch() {
 function bindFeesTabs() {
   const box = $("feesBox");
   box.addEventListener("click", (e) => {
+    // 「显示隐藏模型」开关（与搜索框同在工具行；renderFees 每次重建 DOM，
+    // 故这里必须用事件委托，不能一次性绑定）。
+    const sw = e.target.closest("#btnShowAllModels");
+    if (sw && box.contains(sw)) { toggleShowAllModels(); return; }
     // 模型名点击复制（官方 v2.6.1）：code.fee-model-copy 优先判定，
     // 与下方的 .full-id（二开完整 ID 行）互不冲突、语义一致。
     const code = e.target.closest("code.fee-model-copy");
@@ -1662,6 +1683,16 @@ function bindFeesTabs() {
     if (e.key !== "Enter" && e.key !== " ") return;
     const code = e.target.closest("code.fee-model-copy");
     if (code && box.contains(code)) { e.preventDefault(); copyText(code.dataset.mid, "模型名"); }
+  });
+  // 搜索框：input 即过滤（委托，理由同上）。Esc 清空。
+  box.addEventListener("input", (e) => {
+    if (e.target && e.target.id === "feeSearch") applyFeeSearch();
+  });
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && e.target && e.target.id === "feeSearch") {
+      e.target.value = "";
+      applyFeeSearch();
+    }
   });
 }
 
@@ -1971,6 +2002,82 @@ function renderTaskPanel(v, delta) {
       clearCreditDelta(); // 关闭结果面板即视为「看过了」，撤掉卡片上的 +N 角标
     };
   }
+}
+
+// ---------- 一键领取额外补偿（DeepSeek 模型服务异常 500 积分） ----------
+//
+// 与成长任务的两点差别：
+//   1. **同步**：每账号只有「查状态 + 领取」两个请求，10 个账号也就几秒，
+//      不需要异步轮询那套机制；
+//   2. **先查后领**：已领取 / 活动未生效的账号不会发写请求，
+//      反复点也不会给上游添乱（按钮文案会显示「早已领取」）。
+//
+// 只覆盖 WorkBuddy 国内版账号：补偿挂在 codebuddy.cn 的 billing 域下，
+// 其他渠道没有这个活动（后端已过滤，这里只是文案上说清）。
+
+const COMP_STATUS_META = {
+  claimed:     { ico: "✓", cls: "tk-claimed", text: "本次已领取" },
+  already:     { ico: "✓", cls: "tk-done",    text: "早已领取" },
+  inactive:    { ico: "–", cls: "tk-manual",  text: "活动未生效" },
+  unsupported: { ico: "–", cls: "tk-manual",  text: "渠道不支持" },
+  error:       { ico: "✗", cls: "tk-error",   text: "失败" },
+};
+
+// claimCompensation 触发一键领取。uid 为空 = 全部 WorkBuddy 国内版账号。
+async function claimCompensation(uid) {
+  // 与成长任务共用结果面板：任务在跑时先让用户等，否则轮询会在 2.5s 内覆盖结果。
+  if (taskPollTimer) { toast("成长任务正在执行，请等本轮结束后再领取补偿"); return; }
+  const n = (state.accounts || []).filter((a) => (a.group || "workbuddy") === "workbuddy").length;
+  const who = uid ? "该账号" : `全部 WorkBuddy 国内版账号${n ? `（${n} 个）` : ""}`;
+  const msg =
+    `即将对${who}领取「DeepSeek 模型服务异常额外补偿 500 积分」。\n\n` +
+    "会先查状态再领取：已领取或活动未生效的账号不会发起领取请求。\n" +
+    "各账号截止时间以回执为准（本期至 10/22）。\n\n" +
+    "确定继续？";
+  if (!confirm(msg)) return;
+  try {
+    const v = await api("/api/account/claim_compensation", { uid: uid || "" });
+    renderCompPanel(v);
+    // 到账积分写在后端缓存里，必须显式刷新才能看到余额变化（与任务领奖同因）。
+    try {
+      const r = await api("/api/account/refresh_all", {});
+      await loadState();
+      if (v.claimed > 0) {
+        toast(`领取完成：${v.claimed} 个账号到账 +${v.credit} 分（积分已刷新${r.busy ? "，有刷新在进行" : ""}）`);
+      } else if (v.already > 0) {
+        toast(`这些账号早已领取过（${v.already} 个），无需重复操作`);
+      } else if (v.inactive > 0) {
+        toast("活动未对这些账号生效（可能已结束或未覆盖该账号）");
+      } else {
+        toast("没有可领取的账号");
+      }
+    } catch (e) { toast("领取完成，但积分刷新失败：" + e.message); }
+  } catch (e) { toast(e.message); }
+}
+
+// renderCompPanel 渲染补偿领取结果（复用任务结果面板的样式类）。
+function renderCompPanel(v) {
+  const box = $("taskPanel");
+  if (!box) return;
+  const rows = (v.results || []).map((r) => {
+    const m = COMP_STATUS_META[r.status] || COMP_STATUS_META.error;
+    const credit = r.credit > 0 ? `<span class="tk-gain">+${r.credit}</span>` : "";
+    const end = r.end_time ? `<span class="tk-sum">截止 ${esc(r.end_time)}</span>` : "";
+    const msg = r.msg ? `<span class="tk-err">${esc(r.msg)}</span>` : "";
+    return `<div class="task-acct">
+      <div class="task-acct-head">${esc(r.label || "")}<span class="tk-code">${esc((r.uid || "").slice(0, 8))}</span>
+        <span class="${m.cls}">${m.ico} ${m.text}</span>${credit}${end}${msg}</div>
+    </div>`;
+  }).join("");
+  box.innerHTML = `<div class="task-panel-head">
+      <span class="tk-title">额外补偿领取结果</span>
+      <span class="tk-ok">${v.accounts} 个账号 · 新领 ${v.claimed} · 已领 ${v.already} · 未生效 ${v.inactive}${v.error ? ` · 失败 ${v.error}` : ""}</span>
+      <span class="tk-spacer"></span>
+      <button class="btn small" id="btnCompClose">关闭</button>
+    </div>${rows}`;
+  box.classList.remove("hidden");
+  const closeBtn = $("btnCompClose");
+  if (closeBtn) closeBtn.onclick = () => box.classList.add("hidden");
 }
 
 // clearCreditDelta 清掉增量快照，使卡片角标不再显示。
@@ -3469,6 +3576,7 @@ function bind() {
   $("btnCheckinAll").onclick = checkinAll;
   $("btnRefreshAll").onclick = refreshAll;
   $("btnTasksAll").onclick = () => runTasks("");
+  $("btnClaimComp").onclick = () => claimCompensation("");
   $("btnAddTime").onclick = addTime;
   $("btnCopyUrl").onclick = copyUrl;
   $("btnSubmitCallback").onclick = submitCallback;

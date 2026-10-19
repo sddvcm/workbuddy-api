@@ -1720,3 +1720,78 @@ code.about-repo:active { transform: translateY(1px); }
 @media (max-width: 640px) {
   .fb-foot-row .half2 { flex: 1 1 100%; }
 }
+
+/* ===== 批量执行结果面板（成长任务「一键做任务」/ 补偿「一键领取」共用）=====
+   这两个面板原先在本地版里有样式，上游前端整体替换时只搬走了 JS 与入口按钮，
+   CSS 整块丢失 —— 表现为面板能出数据但完全没排版（文字挤成一团）。
+   这里按现有变量补回，并同时服务补偿领取面板。 */
+.task-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.task-panel-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px 14px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.tk-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.tk-run   { color: var(--primary); }
+.tk-ok    { color: var(--ok); font-weight: 500; }
+.tk-err   { color: var(--danger); }
+.tk-sum   { color: var(--muted); }
+.tk-spacer { flex: 1; }
+.tk-code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px; color: var(--muted);
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 5px;
+}
+.tk-gain { color: var(--ok); font-weight: 600; }
+.tk-reward { color: var(--warn); font-weight: 500; }
+
+/* 单账号块 */
+.task-acct { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.task-acct:last-child { border-bottom: none; }
+.task-acct-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 13px; font-weight: 500; margin-bottom: 6px;
+}
+/* 状态着色（TASK_STATUS_META / COMP_STATUS_META 的 cls 落地处） */
+.task-item.tk-claimed .tk-ico,
+.tk-claimed { color: var(--ok); }
+.task-item.tk-done .tk-ico,
+.tk-done { color: var(--primary); }
+.task-item.tk-error .tk-ico,
+.tk-error { color: var(--danger); }
+.task-item.tk-manual .tk-ico,
+.tk-manual { color: var(--warn); }
+.task-item.tk-skipped .tk-ico,
+.tk-skipped { color: var(--muted); }
+
+/* 任务明细行 */
+.task-list { display: flex; flex-direction: column; gap: 2px; }
+.task-item {
+  display: flex; align-items: baseline; gap: 8px;
+  font-size: 12px; padding: 3px 6px; border-radius: 6px;
+}
+.task-item:nth-child(odd) { background: var(--bg); }
+.tk-ico { flex: 0 0 14px; text-align: center; font-weight: 700; }
+.tk-msg { flex: 1; min-width: 0; color: var(--text); }
+.task-manual {
+  margin-top: 6px; font-size: 12px; color: var(--warn);
+  background: rgba(217,119,6,.08); border-radius: 6px; padding: 4px 8px;
+}
+
+/* 费率区工具行：模型搜索框 + 「显示隐藏模型」开关（renderFees 生成，见 app.js） */
+.fees-tools {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 8px 0 10px;
+}
+.fees-tools #feeSearch { flex: 1 1 240px; min-width: 180px; }
+.fees-tools #btnShowAllModels.on { background: var(--primary); color: #fff; border-color: var(--primary); }

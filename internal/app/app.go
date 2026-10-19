@@ -3910,6 +3910,17 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/account/tasks_status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.TaskRunView())
 	})
+	// 一键领取额外补偿（DeepSeek 模型服务异常 500 积分）。
+	// 同步执行：每账号只有「查状态 + 领取」两个请求，不需要像成长任务那样异步轮询。
+	// uid 为空 = 全部 WorkBuddy 国内版账号。
+	mux.HandleFunc("POST /api/account/claim_compensation", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			UID string `json:"uid"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		run := a.ClaimCompensationAll(req.UID)
+		writeJSON(w, http.StatusOK, run)
+	})
 	// Oczen 通道连通性自测。本仓已停用 Oczen 渠道（不登记 Runtime），
 	// 该端点会如实返回「oczen 渠道未启用」而不是 404 —— 前端面板的测速按钮
 	// 需要一个明确的失败原因，静默 404 只会让人以为接口写错了。
