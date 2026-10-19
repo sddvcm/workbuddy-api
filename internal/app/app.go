@@ -3910,6 +3910,21 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/account/tasks_status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, a.TaskRunView())
 	})
+	// Oczen 通道连通性自测。本仓已停用 Oczen 渠道（不登记 Runtime），
+	// 该端点会如实返回「oczen 渠道未启用」而不是 404 —— 前端面板的测速按钮
+	// 需要一个明确的失败原因，静默 404 只会让人以为接口写错了。
+	mux.HandleFunc("POST /api/config/oczen_test", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			APIKey string `json:"api_key"` // 空 = 用当前生效凭证
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		status, body, via, err := a.TestOczenKey(req.APIKey)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": 0, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": status == 200 || status == 429, "status": status, "body": body, "via_backup": via})
+	})
 	mux.HandleFunc("POST /api/config/custom_channels", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Channels []custom.ChannelConfig `json:"channels"`
