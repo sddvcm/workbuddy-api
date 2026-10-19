@@ -30,24 +30,32 @@ Claude Code / Codex / Cursor / 任意 OpenAI 兼容客户端
 
 ## 二、功能总览
 
-### 2.1 渠道聚合（12 个）
+### 2.1 渠道聚合（20 个）
 
 | 渠道前缀 | 平台 | 手动签到 | 添加账号方式 |
 |---|---|---|---|
 | `workbuddy/` | WorkBuddy 国内版（CodeBuddy） | ✅ | 浏览器 OAuth / 本机客户端导入 |
 | `workbuddyai/` | WorkBuddy 国际版 | ❌ 自动领日活奖励 | 浏览器 OAuth / 本机客户端导入 |
-| `traework/` | TraeWork | ✅ | 浏览器 OAuth |
-| `traecode/` | Trae 代码版（与 TraeWork 共账号） | — | 同 TraeWork |
 | `qodercn/` | QoderCN | ✅ | 浏览器授权 |
 | `qodercom/` | QoderCOM 国际版 | ✅ | 浏览器授权 |
+| `traework/` | TraeWork | ✅ | 浏览器 OAuth |
+| `traecode/` | Trae 代码版（与 TraeWork 共账号） | — | 同 TraeWork |
 | `qwenwork/` | 千问办公 | ❌ 无签到活动 | 浏览器授权 |
-| `monkeycode/` | MonkeyCode（平台托管模型） | ❌ 无签到端点 | 仅本机客户端导入 |
-| `raccoon/` | 小浣熊 | ❌ 无签到端点 | 浏览器授权 **或** 客户端导入 |
-| `loomy/` | 讯飞 Loomy | ❌ 无签到端点 | 仅本机客户端导入 |
 | `glm/` | 智谱清言 | ✅ | CDP 自动捕获 / 手工粘贴 |
+| `monkeycode/` | MonkeyCode（平台托管模型） | ✅ | 仅本机客户端导入 |
+| `raccoon/` | 小浣熊 | ✅ | 浏览器授权 **或** 客户端导入 |
+| `loomy/` | 讯飞 Loomy | ✅（需当日有效对话轮次） | 仅本机客户端导入 |
+| `officeace/` | OfficeAce（华为云果办） | ✅ | 本机桌面端导入 **或** OAuth |
+| `minimax/` | MiniMax Code 中国版 | ✅ | OAuth 设备码登录 |
+| `lobsterai/` | LobsterAI（有道龙虾） | ✅ | 本机回调 OAuth 登录 |
+| `codearts/` | CodeArts（华为云） | ✅ | PKCE OAuth |
+| `cline/` | Cline 免费池 | ❌ Key 不过期，无需签到 | 粘贴官方 `sk_` API Key |
+| `kilo/` | Kilo AI 免费池 | ❌ 免密、无账号 | 无需添加（自动注入匿名账号） |
+| `gemini/` | Gemini（Google Code Assist） | ❌ 配额为窗口百分比 | OAuth |
+| `zcode/` | ZCode（智谱） | ❌ 积分领取未实现（依赖验证码） | 设备授权登录 |
 | `qoder/` | QoderWork | — | 路由保留，界面已下线 |
 
-**导入型渠道**（`monkeycode`、`raccoon`、`loomy`）的凭据由本项目**不产生**，
+**导入型渠道**（`monkeycode`、`raccoon`、`loomy`、`officeace`）的凭据由本项目**不产生**，
 从已登录的官方客户端读取。这类凭据通常有有效期（如 Loomy 约 14 天），
 到期需重新导入。小浣熊两个路径都支持，弹窗里会同时给出两个按钮。
 
@@ -367,6 +375,24 @@ WorkBuddy 单渠道、wild-work 没有成长任务体系 —— 任何一方都�
 
 本项目按「现状提供」发布，不作任何明示或默示担保。使用本项目造成的
 账号封禁、额度损失、数据丢失等一切后果由使用者自行承担。
+
+---
+
+## 九、参与贡献
+
+欢迎报 Issue、提 PR。完整指南见 **[CONTRIBUTING.md](CONTRIBUTING.md)**，要点：
+
+- **提 PR 前本地跑三道关**：`go build ./...`、`go test ./...`、
+  `node scripts/ui-static-check.mjs`。CI（`.github/workflows/ci.yml`）对每个 PR 自动跑同样几项
+- **新增渠道必须走完整链路**：`provider` 常量 → `stats` 登记 → `pool` → `gateway` 路由 →
+  `channelOrder` → `feeChannelOrder` → 前端渠道元信息。漏一处不报错，只会静默少一个 tab
+- **提交说明写「为什么」**，涉及取舍把备选方案和放弃原因写进去——这个仓库的历史提交是这么写的
+- **禁止提交任何凭据**（`auths/`、token、cookie、api_key）
+- 本仓库与 `rockswang/wild-work` 保持三方合并关系，改动落在上游同期也改过的文件上时，
+  请在提交说明注明，能省下双方半小时
+
+Issue 模板已按「bug / 功能建议」分好类；不确定是不是 bug 的请走
+[Discussions](https://github.com/sddvcm/workbuddy-api/discussions)，不要占 issue。
 
 ---
 

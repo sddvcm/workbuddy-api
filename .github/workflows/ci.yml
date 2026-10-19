@@ -1,0 +1,41 @@
+name: CI
+
+# 每个 PR 与 main 的每次推送都跑。目的：把「本地三道关」搬到线上，
+# 让评审人不用先问「你本地跑过吗」。
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  go:
+    name: Go 构建 / vet / 测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # 实盘验证（internal/cline/live_test.go 等）默认不跑：它们带
+      # `//go:build live` 标签且要真 Key，只在本地按需执行。
+      - name: Test
+        run: go test ./...
+
+  frontend:
+    name: 前端静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 语法检查
+        run: node --check cmd/workbuddy-api/web/app.js
+      # 断言冷却标签/汇总条渲染正确，且顶层函数/常量不得重复定义
+      # （曾出现 renderSummary 写了两版、前者成死代码，node --check 与功能测试都发现不了）
+      - name: 静态检查
+        run: node scripts/ui-static-check.mjs

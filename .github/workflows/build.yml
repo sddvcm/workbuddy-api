@@ -49,16 +49,18 @@ jobs:
             suffix: ""
     runs-on: ${{ matrix.os }}
     steps:
-      # workflow_dispatch 手动触发按钮只在默认分支（master）显示，但构建目标始终是 dev；
-      # tag 触发（push v*）则构建对应 tag 的代码
+      # 手动触发（Actions 页面 Run workflow）构建默认分支 main 的当前代码，
+      # 产物进固定的 dev pre-release；tag 触发（push v*）则构建对应 tag 的代码。
+      # 上游 wild-work 的默认分支叫 master/dev，本仓库只有 main —— 三处 ref 必须写 main，
+      # 否则手动触发一上来就 checkout 失败（实测报 "could not find ref master"）。
       #
       # fetch-depth: 0 —— 拉全历史。用途只有一个：让下方「末尾换行检查」能用
-      # `origin/master...HEAD` 拿到真实的改动文件集。浅克隆实测下该 diff 恒为空
+      # `origin/main...HEAD` 拿到真实的改动文件集。浅克隆实测下该 diff 恒为空
       # （不创建 remote-tracking ref、HEAD~1 也不存在），会使那一步形同虚设。
       # 代价是 checkout 变慢，对这个仓库规模可忽略。
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'push' && github.ref || 'master' }}
+          ref: ${{ github.event_name == 'push' && github.ref || 'main' }}
           fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
@@ -98,18 +100,18 @@ jobs:
       # 而顺手修它们属于无关的范围扩张。
       #
       # ⚠️ 前置条件：本步骤依赖 `fetch-depth: 0`（见 checkout 步骤）。
-      # 曾经的写法用浅克隆 + `git fetch origin master`，但实测在 `--depth=1` 下
+      # 曾经的写法用浅克隆 + `git fetch origin main`，但实测在 `--depth=1` 下
       # **恒检查 0 个文件**（浅克隆不创建 remote-tracking ref、`HEAD~1` 也不存在）——
       # 即"在 CI 里放了一盏不亮的灯"。改为完整历史后 diff 基准才真实存在。
       #
-      # 语义说明：基点优先取 origin/master；工作流手动触发时 HEAD 即为 origin/master，
+      # 语义说明：基点优先取 origin/main；工作流手动触发时 HEAD 即为 origin/main，
       # 三点 diff 为空属正常（那是"没有新改动"，不是"检查失效"）。
-      # 仍保持 advisory：从很旧 master 拉的分支，diff 会含上述存量违规文件。
+      # 仍保持 advisory：从很旧 main 拉的分支，diff 会含上述存量违规文件。
       - name: Check trailing newline of changed files (advisory)
         if: matrix.name == 'linux-amd64'
         continue-on-error: true
         run: |
-          BASE="origin/master"
+          BASE="origin/main"
           if git rev-parse --verify --quiet "$BASE" >/dev/null; then
             CHANGED=$(git diff --name-only --diff-filter=ACM "$BASE"...HEAD || true)
           else
@@ -166,7 +168,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # tag 触发（push v*）→ 检出该 tag 代码；手动触发 → 检出 dev 分支代码
-          ref: ${{ github.event_name == 'push' && github.ref || 'master' }}
+          ref: ${{ github.event_name == 'push' && github.ref || 'main' }}
 
       # 注意顺序：先 checkout 再 download-artifact，否则 git 检出会覆盖 artifacts/
       - uses: actions/download-artifact@v4
@@ -218,7 +220,7 @@ jobs:
             exit 0
           fi
           # workflow_dispatch → 每次更新同一个 dev-build 专属 release
-          # 复用固定 tag，避免堆积；不会删除 master 分支的任何发布包
+          # 复用固定 tag，避免堆积；不会删除 main 分支的任何发布包
           DEV_TAG="dev-build"
           if gh release view "$DEV_TAG" >/dev/null 2>&1; then
             gh release delete "$DEV_TAG" --yes --cleanup-tag

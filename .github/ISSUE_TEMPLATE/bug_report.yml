@@ -1,0 +1,80 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提 PR 前请先在本地跑一遍 `go build ./... && go test ./...` ——
+        如果本地就是红的，请直接提 PR 修复，不要开 issue。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 面板「关于」里的版本号，或 `git describe --tags` 的输出
+      placeholder: v0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: channel
+    attributes:
+      label: 涉及渠道
+      description: 可多选。与具体渠道无关（如面板打不开）请选「面板/通用」
+      multiple: true
+      options:
+        - 面板/通用
+        - WorkBuddy 国内版
+        - WorkBuddy 国际版
+        - QoderCN
+        - QoderCOM
+        - TraeWork
+        - Trae 代码版
+        - 千问办公
+        - 智谱清言
+        - OfficeAce
+        - Kilo
+        - MiniMax
+        - LobsterAI
+        - ZCode
+        - Gemini
+        - CodeArts
+        - Cline
+        - MonkeyCode
+        - 小浣熊
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 从零开始、别人能照着做一遍的那种粒度
+      placeholder: |
+        1. 添加一个 xxx 账号
+        2. 打开「模型列表和费率」tab
+        3. 页面空白，控制台报 xxx
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图 / 面板状态
+      description: |
+        **贴之前请抹掉 token、cookie、api_key、账号 uid。**
+        面板截图请连同「运行统计」页一起截，那里有版本与启动时间。
+
+  - type: input
+    id: os
+    attributes:
+      label: 系统与架构
+      placeholder: Windows 11 x64 / macOS arm64 / Ubuntu 24.04 x64

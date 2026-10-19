@@ -2915,3 +2915,109 @@ loomy 上游没有到期字段，`ExpireAt` 保持**留空**（不伪造），�
 - 本轮追加：`TestExpiryUrgency`（今天/明天/5.7 天后三档 + 颜色与 risk 解耦）；
   前端 3 条断言（今天红 / 明天黄 / 远期即使 risk=true 也不上色），
   3 处变异全部确认变红（配色退回按 risk / 明天档用红色 / 远期也上色）。
+
+---
+
+# workbuddy-api v0.2.0
+
+三组改动：**追平上游 wild-work v2.9.3**（三方合并）+ **一键领取额外补偿**（新功能）
++ **社区协作基建**（贡献指南 / issue 模板 / PR CI）。版本 0.1.2 → 0.2.0。
+
+## 一、追平上游 wild-work v2.9.3（v2.6.2 → v2.9.3）
+
+用户给了上游地址后追问同步范围，明确选择「完整追平」：143 个提交、390 个文件、
++78731 行。直接 `git pull` 不可行——本仓库相对上游做过模块名归一化
+（`wild-work` → `workbuddy-api`、`cmd/wild-work/` → `cmd/workbuddy-api/`）与大量本地改造，
+history 完全不共享。
+
+**做法**：导出上游 v2.9.3 全树 → 按同一套归一化规则改写 → 落到 `sync/upstream-v293` 分支
+→ 与本地 `main` 做三方合并。合并前先量化冲突面（`CLEAN 37 / CONFLICT 85 /
+NEW_LOCAL_MISSING 241 / GONE_LOCAL_MISSING 15`，共 390），并验证归一化假设：
+上游 v2.6.2 的 251 个文件里 **241 个归一化后与本地逐字节一致**，只有 10 个需要人工判断。
+
+**规模**：373 文件 / +77804 / -3023。`go build` / `go vet` / `go test ./...` 全绿（48 包、0 失败）。
+
+### 保留的本地能力（与上游同文件冲突时逐块人工消解）
+
+- **成长任务体系**（`internal/upstream/growth*.go`、`desktop.go`、`mp_report.go`、`report.go`）
+  —— 上游删除了这些文件，本地依赖，故保留
+- **费率后缀**（模型名带 ` (0.06x)`）与挑号策略 `max_rotate` / 会话粘性 ——
+  `buildModelEntry` 恢复为方法形式，叠加上游的 `max_output_tokens` / `supports_tools` /
+  `reasoning` / `PublicModelID` 命名空间直通
+- **`internal/platform` 单实例锁**、**API Key 空值拒启动守卫**、**`internal/auth` DPAPI 加密层**
+- 渠道面板把 Kilo 提到费率表首位（其免费模型最常被查）
+
+### 刻意分歧
+
+- `provider.Oczen`：代码与常量保留（便于下次合并），但**不登记 Runtime** ——
+  不路由、不进模型列表、不进费率面板；`/api/config/oczen_test` 返回「渠道未启用」而非 404
+- `cmd/workbuddy-api/proxy.go`（本地每渠道代理）被上游 backuplink（R57）取代，删除
+
+### 合并中发现并修掉的三个静默缺陷
+
+都不报错，只有测试或前后端比对能发现：
+
+1. `NewHandler` 漏了 `fallbacks` / `efforts` 初值 ⇒ 模型降级链与思考强度注入运行期恒为空
+   （9 个 test 失败的根因）
+2. `buildModelEntry` 若采用上游的包级函数，会静默丢掉费率后缀
+3. `/api/config/oczen_test` 被误当成与 `/api/config/growth` 的同一处冲突替换掉 ⇒ 前端测速按钮 404。
+   修复后做了全量比对：app.js 的 45 个 `/api/*` 端点与后端 50 条路由无悬空调用
+
+## 二、一键领取额外补偿（DeepSeek 模型服务异常 500 积分）
+
+个人中心 `plans-usage` 页有一张补偿卡片（限 10/22 前领取），7 个账号要逐个手动点。
+
+**端点发现**：抓页面 HTML → 只有两个 JS → 主包里 grep `compensation` 得
+`POST /billing/meter/compensation-status` 与 `POST /billing/meter/claim-compensation`。
+页面本身用 fetch + Cookie，本仓用既有的 BillingHeaders（Bearer + `X-User-Id`）实测同样通。
+⚠️ **路径不带 `/v2`**（带则 404；而签到的 `checkin-activity-status` 反而带 `/v2`）——
+已在代码注释与测试里锁死，防止以后有人「顺手统一前缀」。
+
+**实现**：
+
+- `internal/upstream/compensation.go` —— 沿用签到那套「先只读探测、再按需写」：
+  已领取 / 活动未生效的账号不发写请求
+- `internal/app/compensation.go` —— 批量编排，只收 WorkBuddy 国内版（补偿挂在 codebuddy.cn，
+  别的渠道调只会 404），单账号失败不中断整批，逐账号回报状态与截止时间
+- 面板账号管理区新增按钮「一键领取额外补偿」，结果面板逐账号显示，到账后自动刷新积分
+
+**实测**：7 个账号首轮 **6 个新领取、合计 +3000 积分**，1 个早已领取，0 失败；
+二轮 7 个全部「早已领取」且 **0 个写请求**（幂等，重复点也安全）。
+测试实例用独立端口 + 独立实例名 + 复制的账号目录跑，未干扰生产实例。
+
+### ✅ 验证
+
+- `go build ./... && go vet ./... && go test ./...` 全绿；新增 12 个用例
+  （上游层 6 例：路径无 `/v2`、已领取不写、活动未生效不写、业务码透传；
+  app 层 6 例：多账号编排、单账号失败不中断、只收 WorkBuddy 国内版、汇总计数）
+
+## 三、社区协作基建
+
+为「大家一起修修补补」补上基础设施：
+
+- **`CONTRIBUTING.md`** —— 本地三道关、分支与提交约定、新渠道必须走完的七处链路、
+  上游同步注意事项、不接收的改动（凭据 / 逆向细节 / 无关大范围搬移）
+- **Issue 模板**（bug / 功能建议）+ **PR 模板** —— bug 表单带渠道下拉（20 个渠道）
+  与「贴日志前抹掉 token」的醒目提醒
+- **`.github/workflows/ci.yml`** —— 每个 PR 与 main 推送自动跑 build / vet / test /
+  前端静态检查，把「你本地跑过吗」这个问题从评审里去掉
+- **修 `.github/workflows/build.yml`**：三处 `ref` 与 diff 基点仍写上游的 `master`
+  （本仓库只有 main）⇒ 手动触发一上来就 checkout 失败。已全部改为 `main` 并注明缘由
+
+## 四、顺带修掉的前端静默缺陷（均为合并遗留）
+
+1. **style.css 整块任务面板样式丢失** —— 上游前端整体替换时只搬走了 JS，
+   「一键做任务」面板其实一直没排版（数据能出，文字挤成一团）
+2. `searching` 声明在 for 循环内却被第二个循环引用 ⇒ 任一渠道模型数为 0 就
+   ReferenceError，费率 tab 白屏
+3. `unpriced` 变量从未声明 ⇒ 进「模型列表和费率」tab 必抛
+4. 费率区的模型搜索框与「显示隐藏模型」开关，DOM 与事件绑定都在合并中丢了 ⇒ 重建 + 事件委托
+
+另修 `scripts/ui-static-check.mjs` 在 Windows 上必误报的问题：`core.autocrlf=true`
+使工作区是 CRLF，而脚本正则按 LF 写 ⇒ 加 `readLF` 归一化；动态生成的 id 进白名单。
+
+## 五、文档修正
+
+README「渠道聚合」表在合并后仍写 12 个，实际已是 20 个（且 MonkeyCode / Loomy /
+小浣熊的签到能力早已实现，表里还标着「无签到端点」）。已按 `channelOrder` /
+`feeChannelOrder` / `noExplicitCheckin` 三处权威定义重写，并新增「九、参与贡献」。
