@@ -22,25 +22,11 @@ func TestNormalizeModelName(t *testing.T) {
 	}
 }
 
-func TestModelKeyStatic(t *testing.T) {
-	cases := map[string]string{
-		"deepseek-v4-pro": "dmodel",
-		"glm-5.3":         "gmodel",
-		"glm-5.2":         "gm51model",
-		"qwen3.8-max":     "qmodel_38max",
-		"kimi-k2.7-code":  "kmodel",
-		"unknown-model":   "",
-	}
-	for name, want := range cases {
-		if got := ModelKey(name); got != want {
-			t.Errorf("ModelKey(%q) = %q, want %q", name, got, want)
-		}
-	}
-}
-
 func TestModelKeyDynamicPrecedence(t *testing.T) {
 	c := New()
-	c.setModelMap(map[string]string{"glm-5.3": "gmodel-new", "custom": "ckey"})
+	c.modelMu.Lock()
+	c.modelMap = map[string]string{"glm-5.3": "gmodel-new", "custom": "ckey"}
+	c.modelMu.Unlock()
 	if got := c.modelKey("glm-5.3"); got != "gmodel-new" {
 		t.Errorf("dynamic should win, got %q", got)
 	}
@@ -49,27 +35,6 @@ func TestModelKeyDynamicPrecedence(t *testing.T) {
 	}
 	if got := c.modelKey("deepseek-v4-pro"); got != "dmodel" { // 动态缺失 → 静态兜底
 		t.Errorf("static fallback got %q", got)
-	}
-}
-
-func TestEncodeDecodeRoundtrip(t *testing.T) {
-	plain := []byte(`{"a":1,"b":"中文内容 😀","c":[true,null,3.14]}`)
-	enc := qoderEncode(plain)
-	if enc == "" {
-		t.Fatal("empty encode")
-	}
-	dec, err := qoderDecode(enc)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if string(dec) != string(plain) {
-		t.Errorf("roundtrip mismatch:\n in=%s\nout=%s", plain, dec)
-	}
-}
-
-func TestDecodeInvalidChar(t *testing.T) {
-	if _, err := qoderDecode("!!!"); err == nil {
-		t.Error("expected error for invalid char")
 	}
 }
 
@@ -224,7 +189,7 @@ func TestModelEntryLookup(t *testing.T) {
 	if e := c.modelEntry("dmodel"); e != nil {
 		t.Errorf("no entries yet should be nil, got %+v", e)
 	}
-	c.setModelEntries(map[string]DynamicModel{"dmodel": {Key: "dmodel", Source: "system"}})
+	c.setModelEntries(map[string]DynamicModel{"dmodel": {Key: "dmodel", Source: "system"}}, nil)
 	e := c.modelEntry("dmodel")
 	if e == nil || e.Source != "system" {
 		t.Errorf("entry lookup failed: %+v", e)

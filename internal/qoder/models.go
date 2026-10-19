@@ -104,12 +104,6 @@ func (w modelWire) parseContextConfig() (int64, []int64) {
 	return cc.tokenCount(), cc.windows()
 }
 
-// contextWindow 解析 context_config 得到默认档上下文窗口（兼容旧调用点）。
-func (w modelWire) contextWindow() int64 {
-	def, _ := w.parseContextConfig()
-	return def
-}
-
 // parseSceneModels 解析模型列表响应：assistant→developer→chat 三级回退。
 // 上游把模型挪场景时（如迁到 assistant）不至于硬失败。
 func parseSceneModels(apiResp map[string]json.RawMessage) ([]DynamicModel, error) {
@@ -215,8 +209,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 		}
 		out = append(out, mi)
 	}
-	c.setModelMap(mm)
-	c.setModelEntries(entries)
+	c.setModelEntries(entries, mm)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}

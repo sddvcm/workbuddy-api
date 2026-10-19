@@ -4,8 +4,9 @@ package stats
 
 import (
 	"sort"
-	"strings"
 	"time"
+
+	"workbuddy-api/internal/provider"
 )
 
 // minGenSecForTput 计入 per-model 吞吐聚合的最小生成耗时：
@@ -50,6 +51,14 @@ type ModelStat struct {
 	AvgTTFBMs    int64   `json:"avg_ttfb_ms"`
 	AvgTokPerSec float64 `json:"avg_tok_per_sec"`
 	PerfSamples  int64   `json:"perf_samples"`
+
+	// 缓存利用率（今日）：CR = 命中 token 合计，CRCov = **上报该维度**请求的
+	// prompt 合计（分母），CRReqs = 上报请求数。CRRov==0 表示今日无样本，
+	// 前端显示「—」而不显示 0%（与「命中率真的为 0」区分开）。
+	// 口径与语义同 ledger.UsageEntry 的 CR/CRC，取数点见 server/cacheusage.go。
+	CR     int64 `json:"cr,omitempty"`
+	CRCov  int64 `json:"cr_cov,omitempty"`
+	CRReqs int64 `json:"cr_reqs,omitempty"`
 }
 
 // modelEntry per-model 今日累计（消耗 + 性能采样）。
@@ -63,6 +72,13 @@ type modelEntry struct {
 	tokens int64
 	credit float64
 
+	// 缓存维度：cr = 命中 token 合计；crCov = **上报该维度**请求的 prompt 合计
+	// （分母）；crReqs = 上报请求数。crCov==0 ⇒ 该模型无样本 ⇒ 面板显示「—」。
+	// 语义与口径详见 ledger.UsageEntry 的 CR/CRC 注释与 server/cacheusage.go。
+	cr     int64
+	crCov  int64
+	crReqs int64
+
 	ttfbSumMs int64
 	perfCnt   int64
 	genTokens int64
@@ -71,10 +87,12 @@ type modelEntry struct {
 
 // AddUsage 记录一次代理请求的 usage（全局精确口径 + per-model 消耗与性能采样）。
 // prompt/completion 为上游 usage 帧的 token 数；credit 为本次精确积分（无则 0）。
+// cacheReported 表示上游**是否上报**了缓存命中字段；cacheHit 为命中 token 数
+// （prompt 的子集）。仅 cacheReported 时才进入缓存利用率的分母/分子。
 // ttfbMs 为首字节耗时（毫秒）；genSec 为生成耗时（总时长 − 首字节，秒），
 // <=50ms 或 completion=0 时只计入 TTFB 平均、不计入吞吐（与请求日志 tok/s 判定
 // 同口径）。异常负值帧钳 0 拒记，防止污染今日口径与跨天后的历史 map。
-func (s *Stats) AddUsage(model string, prompt, completion int64, credit float64, ttfbMs int64, genSec float64, now time.Time) {
+func (s *Stats) AddUsage(model string, prompt, completion int64, credit float64, ttfbMs int64, genSec float64, cacheHit int64, cacheReported bool, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rollDayLocked(now)
@@ -89,6 +107,9 @@ func (s *Stats) AddUsage(model string, prompt, completion int64, credit float64,
 	}
 	if ttfbMs < 0 {
 		ttfbMs = 0
+	}
+	if cacheHit < 0 {
+		cacheHit = 0
 	}
 
 	s.tokensToday += prompt + completion
@@ -105,6 +126,12 @@ func (s *Stats) AddUsage(model string, prompt, completion int64, credit float64,
 	m.reqs++
 	m.tokens += prompt + completion
 	m.credit += credit
+	// 缓存：只有上游明确上报该维度时才计入（未上报的请求不稀释命中率）
+	if cacheReported {
+		m.cr += cacheHit
+		m.crCov += prompt
+		m.crReqs++
+	}
 	m.ttfbSumMs += ttfbMs
 	m.perfCnt++
 	if genSec >= minGenSecForTput && completion > 0 {
@@ -139,15 +166,15 @@ func (s *Stats) Logs(limit int) []ReqRow {
 	return out
 }
 
-// channelOfModel 取模型名的渠道前缀（形如 "workbuddy/deepseek-v4.1-flash"；
-// 返回值未归一，归一由调用方 normalizePlatform 处理）。
+// channelOfModel 取模型名的渠道前缀，返回 (渠道 kind, 是否在白名单内)。
+// 解析与 provider.SplitModelID 同源：上游命名空间写法（cline-free/x）归到其渠道（cline），
+// 否则统计会把 cline 的 token 漏掉（R59）。
 func channelOfModel(model string) (string, bool) {
-	i := strings.IndexByte(model, '/')
-	if i <= 0 {
-		return "", false
+	if k, _, ok := provider.SplitModelID(model); ok {
+		g := k.String()
+		return g, IsKnownChannel(g)
 	}
-	g := model[:i]
-	return g, channelKind[g]
+	return "", false
 }
 
 // modelStatsLocked 生成今日按模型消耗行（调用方须持锁；积分降序）。
@@ -155,6 +182,10 @@ func (s *Stats) modelStatsLocked() []ModelStat {
 	models := make([]ModelStat, 0, len(s.models))
 	for name, m := range s.models {
 		st := ModelStat{Model: name, Reqs: m.reqs, Tokens: m.tokens, Credit: m.credit}
+		// 缓存透出（0 值省略在 JSON 里，前端据 cr_cov 判定样本量）
+		if m.crCov > 0 {
+			st.CR, st.CRCov, st.CRReqs = m.cr, m.crCov, m.crReqs
+		}
 		if m.perfCnt > 0 {
 			st.AvgTTFBMs = m.ttfbSumMs / m.perfCnt
 			st.PerfSamples = m.perfCnt

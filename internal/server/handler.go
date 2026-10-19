@@ -15,7 +15,9 @@ import (
 	"time"
 
 	"workbuddy-api/internal/auth"
+	"workbuddy-api/internal/config"
 	"workbuddy-api/internal/ledger"
+	"workbuddy-api/internal/loopguard"
 	"workbuddy-api/internal/pool"
 	"workbuddy-api/internal/provider"
 	// 别名 statsEngine：与运行统计引擎包名一致（本包无同名局部变量，别名仅为与 app 包对齐可读）
@@ -32,8 +34,19 @@ type Runtime struct {
 	// NoCooldownOnServerError 声明该渠道的上游 5xx 属于网关/基础设施抖动
 	// （账号本身健康），不应计入账号错误触发冷却。
 	// WorkBuddy 国际版开启（其 openresty 网关实测间歇性 502/503/504）。
-	// 其余渠道保持 false，行为不变。
+	//
+	// ⚠️ 2026-10-18 起本字段**不再决定计数行为**（5xx 已默认不计数，见
+	// CountServerErrorAsAccountFault），仅保留作渠道差异的文档标注。
 	NoCooldownOnServerError bool
+
+	// CountServerErrorAsAccountFault 显式要求「本渠道的上游 5xx 计入账号错误」。
+	//
+	// 默认 false（5xx 不计入账号错误）：5xx 的语义是服务端故障，与客户端凭据健康无关。
+	// 曾经的默认行为是「计入」，导致一次上游 500 风暴把整池健康账号打成
+	// consecutive errors 冷却 10 分钟，整条渠道 503（2026-10-18 lobsterai 实测）。
+	//
+	// 仅当某渠道**确实用 5xx 表达账号级封禁/欠费**时才置 true —— 当前无一渠道如此。
+	CountServerErrorAsAccountFault bool
 
 	// SingleAccount 声明该渠道只有唯一一个、且**无法人工恢复**的账号（当前仅 oczen 匿名）。
 	// 语义：任何账号级惩罚（冷却/计数/禁用）都等价于「整条渠道下线」，故一律不适用——
@@ -78,6 +91,18 @@ type Config struct {
 	ErrThreshold int
 	ErrCooldown  time.Duration
 	RefreshSkew  time.Duration
+
+	// HardCooldownFor 硬冷却（402 余额/权益不足）时长的计算钩子：nil 时恒用
+	// HardCooldown。非 nil 时由装配层注入「截到每日发奖窗口」策略（见
+	// config.HardCooldownFor）——放在钩子里而不是 server 直接依赖 config，
+	// 是因为 server 包只依赖 provider/pool/ledger，不引入配置层。
+	HardCooldownFor func(now time.Time) time.Duration
+
+	// ModelFallbacks 模型降级链初始值（面板保存后经 SetModelFallbacks 热更新）。
+	ModelFallbacks []config.ModelFallbackRule
+
+	// ReasoningEfforts 思考强度注入映射初始值（面板保存后经 SetReasoningEfforts 热更新）。
+	ReasoningEfforts map[string]string
 }
 
 // stickyEntry 粘性路由记录：记录上次路由账号及连续使用次数。
@@ -100,6 +125,48 @@ type Handler struct {
 	apiMu    sync.RWMutex // 保护 cfg.APIKey（面板可运行时修改）
 	stickyMu sync.RWMutex
 	sticky   map[string]*stickyEntry // runtimeKind → stickyEntry
+
+	fbMu      sync.RWMutex               // 保护 fallbacks（面板可运行时修改）
+	fallbacks []config.ModelFallbackRule // 模型降级链（cfg.ModelFallbacks 初始，热更新经 SetModelFallbacks）
+
+	efMu    sync.RWMutex      // 保护 efforts（面板可运行时修改）
+	efforts map[string]string // 思考强度注入映射（cfg.ReasoningEfforts 初始，热更新经 SetReasoningEfforts）
+
+	runtimesMu sync.RWMutex               // 保护 customRts 动态热更新（R66）
+	customRts  map[provider.Kind]*Runtime // 自定义渠道运行时
+}
+
+// SetCustomRuntimes 热更新自定义渠道运行时（面板保存后由 app 层回调）。
+func (h *Handler) SetCustomRuntimes(rts map[provider.Kind]*Runtime) {
+	h.runtimesMu.Lock()
+	h.customRts = rts
+	h.runtimesMu.Unlock()
+}
+
+// getRuntime 取渠道运行时。内建渠道优先——自定义渠道名不得与内建同名，
+// 该约束由 custom.ChannelConfig.Validate 强制（否则两层会指向不同 Runtime：
+// 面板/账号操作打到自定义池，而对话请求走内建渠道）。
+func (h *Handler) getRuntime(k provider.Kind) *Runtime {
+	if rt := h.cfg.Runtimes[k]; rt != nil {
+		return rt
+	}
+	h.runtimesMu.RLock()
+	defer h.runtimesMu.RUnlock()
+	return h.customRts[k]
+}
+
+// SetModelFallbacks 热更新模型降级链（面板保存后由 app 层回调；nil/空 = 清空禁用）。
+func (h *Handler) SetModelFallbacks(rules []config.ModelFallbackRule) {
+	h.fbMu.Lock()
+	h.fallbacks = rules
+	h.fbMu.Unlock()
+}
+
+// SetReasoningEfforts 热更新思考强度注入映射（面板保存后由 app 层回调；nil/空 = 清空禁用）。
+func (h *Handler) SetReasoningEfforts(efforts map[string]string) {
+	h.efMu.Lock()
+	h.efforts = efforts
+	h.efMu.Unlock()
 }
 
 func NewHandler(cfg Config) *Handler {
@@ -126,7 +193,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sticky: make(map[string]*stickyEntry), ledger: cfg.Ledger, stats: cfg.Stats}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sticky: make(map[string]*stickyEntry), ledger: cfg.Ledger, stats: cfg.Stats, fallbacks: cfg.ModelFallbacks, efforts: cfg.ReasoningEfforts}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -171,10 +238,19 @@ func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
 		if acct != nil {
 			status, ok := rt.Pool.Status(sticky.uid)
 			modelCooled := ok && status.ModelCooling != nil && status.ModelCooling[model].After(time.Now())
-			if ok && !status.Cooling && !status.Disabled && !modelCooled {
+			// ⚠️ 2026-10-18 补 SessionDead：本判据曾只查 Cooling/Disabled/模型级冷却，
+			// 而 `healthy()`（pool.go:103）明确把 sessionDead 也算不健康。
+			// 粘性路由直接调 AuthByUID、**绕过了 healthy()**，于是登录态已失效的账号
+			// 仍被粘住 ⇒ 每个请求都白打一次必 401 的上游探测。
+			// （MonkeyCode 实测：全日志 16 条 session_dead 401，且一次刷新都没发起。）
+			if ok && !status.Cooling && !status.Disabled && !status.SessionDead && !modelCooled {
 				log.Printf("sticky route platform=%s uid=%s count=%d/%d",
 					rt.Kind, sticky.uid, sticky.reqCount, sticky.maxReqs)
 				return acct
+			}
+			if ok && status.SessionDead {
+				log.Printf("sticky route skipped platform=%s uid=%s reason=session_dead",
+					rt.Kind, sticky.uid)
 			}
 		}
 	}
@@ -264,8 +340,10 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	accounts := map[string]any{}
 	for _, k := range h.runtimeKinds() {
-		rt := h.cfg.Runtimes[k]
-		accounts[k.String()] = rt.Pool.List()
+		rt := h.getRuntime(k)
+		if rt != nil && rt.Pool != nil {
+			accounts[k.String()] = rt.Pool.List()
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": accounts})
 }
@@ -316,8 +394,8 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) modelList() []map[string]any {
 	out := []map[string]any{}
 	for _, k := range h.runtimeKinds() {
-		rt := h.cfg.Runtimes[k]
-		if rt.Pool == nil || len(rt.Pool.List()) == 0 { // 只暴露已接入账号的平台
+		rt := h.getRuntime(k)
+		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 { // 只暴露已接入账号的平台
 			continue
 		}
 		infos := h.fetchRuntimeModels(rt)
@@ -335,8 +413,12 @@ func (h *Handler) modelList() []map[string]any {
 // OpenAI 官方仅规定 id/object/created/owned_by，未定义能力字段；
 // 多模态能力按 OpenRouter / llama.cpp 通行的 architecture.input_modalities 透传。
 // 上游模型列表接口未返回能力信息时，按惯例回退为 ["text"]。
+// 思考档位（issue #96）：按 Buddy2api v2.1.11 口径透传 reasoning 对象，
+// 上游未声明档位时整个对象不出现（不编造；supports_reasoning 同理不输出）。
 func buildModelEntry(k provider.Kind, mi provider.ModelInfo) map[string]any {
-	id := k.String() + "/" + mi.ID
+	// 对外 ID 与 provider.PublicModelID 同源：上游 ID 自带命名空间的渠道（cline 的 cline-free/*）
+	// 直接透传上游 ID，不再拼 `<渠道>/`（决议 R59；旧的 cline/cline-free/* 仍可路由）。
+	id := provider.PublicModelID(k, mi.ID)
 	entry := map[string]any{"id": id, "object": "model", "created": 1753600000, "owned_by": k.String()}
 	if mi.ContextWindow > 0 {
 		entry["context_length"] = mi.ContextWindow
@@ -344,9 +426,26 @@ func buildModelEntry(k provider.Kind, mi provider.ModelInfo) map[string]any {
 	if mi.MaxTokens > 0 {
 		entry["max_output_tokens"] = mi.MaxTokens
 	}
+	if mi.SupportsTools {
+		entry["supports_tools"] = true
+	}
 	entry["architecture"] = map[string]any{
 		"input_modalities": mi.InputModalities(),
 		"modality":         mi.Modality(),
+	}
+	if len(mi.ReasoningEfforts) > 0 || mi.DefaultReasoningEffort != "" {
+		reasoning := map[string]any{}
+		if len(mi.ReasoningEfforts) > 0 {
+			reasoning["supported_efforts"] = mi.ReasoningEfforts
+		}
+		if mi.DefaultReasoningEffort != "" {
+			reasoning["default_effort"] = mi.DefaultReasoningEffort
+		}
+		if mi.CanDisableThinking != nil {
+			reasoning["can_disable_thinking"] = *mi.CanDisableThinking
+		}
+		entry["reasoning"] = reasoning
+		entry["supports_reasoning"] = true
 	}
 	return entry
 }
@@ -448,17 +547,71 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientModel := peek.Model // 客户端请求的原始模型名（含 channel/ 前缀），回填进响应
+	// 诊断：记录上下文构成摘要（config.body_log 关闭时立即返回，无实际开销）。
+	// 必须放在 rewriteModel 之前——要记的是客户端发来的原始体，而非改写后的。
+	if h.ledger != nil {
+		h.ledger.TraceBody(rt.Kind.String(), clientModel, body)
+	}
+	// 统计/流水的归一 ID：新旧写法（cline-free/x 与 cline/cline-free/x）归一到同一串，
+	// 否则同一模型会在用量榜/请求日志里裂成两行（R59）；其余渠道为恒等变换。
+	canonModel := provider.CanonicalModelID(clientModel)
+	// 模型降级链：请求模型在本渠道已无账号可承载（no_healthy_account 的两种形态——
+	// 「模型全冷」或「整渠道全灭」，pickWithSticky 必败）时，按用户配置的链找第一个
+	// 仍有可用账号的备胎模型顶上；备胎可跨渠道，渠道全灭时不至于直接 503。
+	// 仅此场景触发，正常路由零开销；不粘滞——每个请求都按原模型重新判定，上游解冻即自动切回。
+	// fbApplied=实际备胎全路径（用于把响应 model 字段/X-Model-Fallback 头告知 agent）；
+	// dispModel=写进响应的模型名（无降级=客户端请求名，保持官方「回填请求名」语义；降级=备胎全路径，
+	// agent 读 chunk.model / resp.model 即可感知实际执行模型）。
+	var fbApplied string
+	// skipSameChannel=false：入口降级不限制渠道（见请求内重入点的理由）。
+	fbID, primaryAvail := h.pickModelFallback(rt, model, false)
+	// 口径说明：降级期间 ledger/stats 的 token 流水按**实际执行模型**记账
+	// （statRow.Model、AddUsage(acctModel)、ledgerModelOf(acctModel)）——谁实际工作、
+	// 谁实际消耗 token/积分，就记在谁名下（2026-10-16 口径变更，推翻原「按客户端
+	// 请求名记账」设计）。acctModel=记账归属模型（无降级=canonModel；降级=备胎的
+	// 规范对外 ID，归一函数同构，新旧写法仍归同一行）；原请求名→备胎的对照由
+	// 日志行 + 面板「降级记录」区块 + X-Model-Fallback 头/响应 model 字段承担。
+	acctModel := canonModel
+	if fbID != "" {
+		if rt2, m2, err := h.runtimeForModel(fbID); err == nil {
+			log.Printf("model fallback platform=%s from=%s to=%s", rt.Kind, clientModel, fbID)
+			// 响应头标注实际备胎（必须在任何 WriteHeader 之前；sw 透传 Header）
+			w.Header().Set("X-Model-Fallback", clientModel+" -> "+fbID)
+			rt, model = rt2, m2
+			fbApplied = fbID
+			acctModel = provider.CanonicalModelID(fbID)
+		}
+	}
+	dispModel := clientModel
+	if fbApplied != "" {
+		dispModel = fbApplied
+	}
+	// 降级事件喂入运行统计（面板「降级记录」区块）：降级命中记一条；未降级且
+	// 原模型容量在位时拿本请求当恢复探针（本请求后续成败不影响，
+	// 恢复语义=「重新有可用账号」而非「重新请求成功」）。
+	if h.stats != nil {
+		switch {
+		case fbApplied != "":
+			h.stats.NoteFallback(clientModel, fbApplied, time.Now())
+		case primaryAvail:
+			h.stats.NoteFallbackRecovery(clientModel, time.Now())
+		}
+	}
 	body, err = rewriteModel(body, model)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 思考强度注入：客户端未传 reasoning_effort 且面板配置命中（按客户端请求模型 ID 匹配，
+	// 含 `*` 全局默认）时补上档位。未配置 = 零开销直通（applyEffort 内部快检）；
+	// 注入失败仅记日志、原 body 照发，绝不因此中断请求。
+	body = h.applyEffort(body, clientModel)
 
 	// 运行统计插桩：每客户端请求一行（最终结果；中间换号尝试不逐行——对齐 sidecar 口径）。
 	// TTFB 由 statWriter 记首字节，耗时/吞吐在出口由 defer 收口；
 	// Status 未显式赋值 = 成功写回（200）。
 	var statRow statsEngine.ReqRow
-	statRow.Model = clientModel
+	statRow.Model = acctModel
 	if peek.Stream {
 		statRow.Mode = "流"
 	} else {
@@ -479,12 +632,113 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
+	// 轮转选号 + 上游交互 + 耗尽出口整体平移至 serveRotation（方案 B：轮转耗尽且最后
+	// 错误是积分耗尽时，按降级链当场切备胎、以备胎重入同一轮转段——抽方法使重入=
+	// 再次调用；成功/错误出口与记账 defer 全留在本函数，「一个客户端请求一行」口径
+	// 不变）。serveRotation 保持纯轮转语义；降级状态同步（模型改写/档位注入/记账
+	// 归属/响应头）由本函数在重入前完成，与入口降级完全同构。
+	for fbAttempt := 0; ; fbAttempt++ {
+		res := h.serveRotation(w, sw, rt, model, body, clientModel, dispModel, acctModel, &statRow, peek.Stream)
+		if res.done {
+			return
+		}
+		// 候选耗尽待透传（res.lastStatus>0）：方案 B 判定——对两类「本渠道确实
+		// 顶不住」的错误就地换模型：
+		//   ① ErrHardCredit（积分耗尽）：账号刚进 12h 硬冷却，本渠道容量已翻 false；
+		//   ② ErrSoftRate（模型饱和）：14003「Model busy」/6004「usage exceeds
+		//      frequency limit」——上游明确按模型限额并建议「switch to the other
+		//      models」，本渠道全部账号对该模型都在模型级冷却，轮转已无可选号。
+		// 为什么 ② 必须纳入（2026-10-17 生产实录）：14003 被 Classify 判软限流后
+		// 只冷「账号×模型」60s，而请求内降级原先只认 ErrHardCredit ⇒ 饱和时段的
+		// **第一个**请求必然把 429 原样抛给客户端，第二个请求才由入口降级链顶上
+		// （app.log 20:46:00 吃 429、20:46:01 降级成功，同一分钟后续 8 个请求全绿）。
+		// 账号级 429 也会因此换模型：比让客户端直接失败更友好，代价是可能多烧
+		// 备胎额度——已由用户裁决接受。
+		// 仅重入一次（防备胎再降备胎死循环）；单账号渠道豁免（透传是惩罚豁免
+		// 不变量的设计约束）；此刻未写过任何字节（轮转失败路径天然成立——所有
+		// 写出都发生在成功流式/非流式分支内），降级头可安全补发；无规则/备胎无
+		// 容量 → fb2 为空，维持原样透传，与现状一致。
+		if fbAttempt == 0 && fallbackWorthy(res.lastKind) && !rt.SingleAccount {
+			// 请求内重入只跨渠道（skipSameChannel=true）：同渠道兄弟模型走的是同一批
+			// 账号，若本轮 429 其实是账号级限流（traework/qwenwork/qodercn/qodercom
+			// 等渠道把任意 429 都归 ErrSoftRate），再打一遍同一批账号必然二次撞墙；
+			// 且该账号第二个模型也撞墙后，pool 会把「模型级冷却」升级为「账号级冷却」
+			// ——冷却时长取已有条目的最晚到期时刻（不延长），变的是粒度：可用容量从
+			// 「1 个模型格子」缩到「0，整号对所有模型下线」。
+			// 入口降级不设此限：那里「该模型已全冷」是既有事实，换同渠道兄弟模型
+			// 正是降级链配置的本意（上游配额按模型计，模型 A 冷不代表模型 B 冷）。
+			if fb2, _ := h.pickModelFallback(rt, model, true); fb2 != "" {
+				if rt2, m2, err2 := h.runtimeForModel(fb2); err2 == nil {
+					nb, err3 := rewriteModel(body, m2)
+					if err3 == nil {
+						log.Printf("model fallback platform=%s from=%s to=%s", rt.Kind, clientModel, fb2)
+						// 响应头必须在任何 WriteHeader 之前（此刻未写过任何字节）；
+						// 改写成功才发——失败走透传时不得残留降级头（S1）。
+						w.Header().Set("X-Model-Fallback", clientModel+" -> "+fb2)
+						body = nb
+						body = h.applyEffort(body, clientModel) // 与入口同参数；键已存在不碰（双注入守卫）
+						rt, model = rt2, m2
+						dispModel = fb2
+						acctModel = provider.CanonicalModelID(fb2) // 记账归属=备胎（0021/PR #148 口径）
+						statRow.Model = acctModel
+						statRow.Status = 0 // 429 轮转已污染；出口 defer 靠 Status==0 记 200
+						if h.stats != nil {
+							h.stats.NoteFallback(clientModel, fb2, time.Now()) // 请求内降级也喂降级记录
+						}
+						continue
+					}
+					log.Printf("model fallback body rewrite failed platform=%s to=%s err=%v（维持原样透传）", rt.Kind, fb2, err3)
+				}
+			}
+		}
+		transparentError(w, res.lastStatus, res.lastBody)
+		return
+	}
+}
+
+// rotationResult：serveRotation 的判定结果。done=true=响应已完整写回（成功/请求级
+// 错误/耗尽诊断引导），调用方直接收尾；done=false 且 lastStatus>0=候选耗尽待透传，
+// 由调用方决定原样透传还是按降级链请求内重入（fallbackWorthy 判定）。
+type rotationResult struct {
+	done       bool
+	lastKind   provider.ErrKind
+	lastStatus int
+	lastBody   []byte
+}
+
+// fallbackWorthy 报告「轮转耗尽后是否值得就地换模型」。
+//
+// 只认两类「本渠道对该模型已无承载能力」的错误：
+//   - ErrHardCredit：积分耗尽 → 账号进 12h 硬冷却，本渠道容量已翻 false；
+//   - ErrSoftRate：模型饱和（14003 Model busy / 6004 usage exceeds frequency
+//     limit）→ 全部账号对该模型都在模型级冷却，轮转已无号可选。
+//
+// 其余错误不换模型：内容类/请求类错误换模型必然复现（换模型只是白烧备胎额度），
+// 5xx/登录态问题换模型也治不了本，原样透传让客户端与运维看到真实原因。
+func fallbackWorthy(kind provider.ErrKind) bool {
+	return kind == provider.ErrHardCredit || kind == provider.ErrSoftRate
+}
+
+// serveRotation：chatCompletions 的轮转选号 + 上游交互 + 耗尽出口段（原代码整体
+// 平移，零缩进变化；结果经命名返回值承载——done 默认 true，既有裸 return 语义
+// 原样保留：所有提前返回的出口都已把响应写完）。轮转中「账号级可轮换」错误
+// （kind.Rotatable()）换号续试并置位 lastKind；请求级/内容类错误在循环内提前
+// 透传返回。方案 B 重入时由调用方完成全部降级状态同步后再次调用本方法（tried
+// 随调用重建，备胎渠道天然全新）。
+func (h *Handler) serveRotation(
+	w http.ResponseWriter, sw *statWriter, rt *Runtime, model string, body []byte,
+	clientModel, dispModel, acctModel string, statRow *statsEngine.ReqRow, stream bool,
+) (res rotationResult) {
+	res.done = true // 默认：既有 return 出口都已把响应写完（成功/请求级错误/诊断引导）
 	tried := map[string]bool{}
 	var lastErr error
 	// 最后一次上游错误的原始 status+body：候选耗尽时原样透传（而非包装成 503），
 	// 客户端才能看到 6004 重置时间等上游细节。内容类错误在循环内已提前透传，不受影响。
 	var lastStatus int
 	var lastBody []byte
+	// lastKind：轮转中最后一个「账号级可轮换」错误的类别（Rotatable 分支置位）——
+	// 候选耗尽透传前交回调用方做方案 B 判定；成功/请求级错误不置位（零值 ErrNone）。
+	var lastKind provider.ErrKind
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := h.pickWithSticky(rt, model)
 		if acct == nil {
@@ -507,7 +761,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.stickyClear(rt)
 				var ue *provider.Error
 				if errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead {
-					rt.Pool.Disable(acct.UID, "refresh session dead")
+					rt.Pool.MarkSessionDead(acct.UID, "refresh: "+err.Error())
 				} else {
 					rt.Pool.Cooldown(acct.UID, pool.CoolErr, h.cfg.ErrCooldown, "refresh: "+err.Error())
 				}
@@ -542,50 +796,106 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 尤其在 429（唯一需要的背压）上：冷却后后续请求会在挑号阶段被挡成
 			// no_healthy_account，反而不如透传 429 让客户端按 Retry-After 自行重试。
 			if rt.SingleAccount {
-				log.Printf("upstream error platform=%s uid=%s status=%d kind=%s（单账号渠道不罚账号，原文透传）",
-					rt.Kind, acct.UID, status, kind)
+				// 402（权益不足）例外：账号本身健康，同号其他模型照常可用，只冷却「账号×该模型」
+				// ——下一次请求挑号阶段即「模型全冷」，自动触发降级链顶替；本次仍原文透传。
+				if kind == provider.ErrHardCredit {
+					rt.Pool.CooldownModel(acct.UID, model, h.hardCooldown(), "402 权益不足")
+					log.Printf("model cooldown (single-account 402) platform=%s uid=%s model=%s cooldown=%s",
+						rt.Kind, acct.UID, model, h.hardCooldown())
+				}
+				// 日志点明错误性质与上游原文：旧文案（「不罚账号」）会让用户看到 403 时
+				// 误以为「工具把这个错误当成了请求级问题」，掩盖了真实原因（issue #117）。
+				log.Printf("upstream error platform=%s uid=%s status=%d kind=%s body=%s（单账号渠道无号可轮换，故原样透传、不冷却）",
+					rt.Kind, acct.UID, status, kind, truncateBody(respBody))
 				transparentError(w, status, respBody)
 				return
 			}
 			switch kind {
 			case provider.ErrHardCredit:
-				rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "余额/权益不足")
+				rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.hardCooldown(), "余额/权益不足")
 			case provider.ErrSoftRate:
-			// 429/6004 上游按模型限额（「您也可以切换其他模型继续使用」）：
-			// 只冷却该账号的该模型，同号其他模型继续参与选号；
-			// 短时间内第二个模型也撞墙时 CooldownModel 会升级整号冷却（防上游按账号计时）。
-			// 冷却时长按 6004 响应体的真实重置点解析（#82）：固定 60s 与上游「按重置点解封」
-			// 不符，解析失败/非正回退 SoftCooldown；升级时整号冷却到最晚重置点。
-			escalated := rt.Pool.CooldownModel(acct.UID, model, h.softRateCooldown(string(respBody)), "429 rate limit")
-			if escalated {
-				log.Printf("model cooldown escalated to account platform=%s uid=%s model=%s", rt.Kind, acct.UID, model)
-			} else {
-				log.Printf("model cooldown platform=%s uid=%s model=%s", rt.Kind, acct.UID, model)
-			}
-		case provider.ErrSessionDead:
-				rt.Pool.Disable(acct.UID, "session dead")
+				// 429/6004 上游按模型限额（「您也可以切换其他模型继续使用」）：
+				// 只冷却该账号的该模型，同号其他模型继续参与选号；
+				// 短时间内第二个模型也撞墙时 CooldownModel 会升级整号冷却（防上游按账号计时）。
+				// 冷却时长按 6004 响应体的真实重置点解析（#82）：固定 60s 与上游「按重置点解封」
+				// 不符，解析失败/非正回退 SoftCooldown；升级时整号冷却到最晚重置点。
+				escalated := rt.Pool.CooldownModel(acct.UID, model, h.softRateCooldown(string(respBody)), "429 rate limit")
+				if escalated {
+					log.Printf("model cooldown escalated to account platform=%s uid=%s model=%s", rt.Kind, acct.UID, model)
+				} else {
+					log.Printf("model cooldown platform=%s uid=%s model=%s", rt.Kind, acct.UID, model)
+				}
+			case provider.ErrSessionDead:
+				// 登录态失效不再混入「停用」：标记 SessionDead（挑号跳过 + 面板徽标 +
+				// 重新登录入口），与用户手动停用（Disable）分离（#134）。
+				rt.Pool.MarkSessionDead(acct.UID, truncateBody(respBody))
+				log.Printf("session dead marked platform=%s uid=%s", rt.Kind, acct.UID)
 			case provider.ErrNotFound:
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
-			case provider.ErrContentBlocked, provider.ErrPromptTooLong, provider.ErrPassthrough:
-				// 内容拦截/上下文超限/请求级拒绝：不冷却不熔断不计错，直接透传原文回客户端。
+			case provider.ErrContentBlocked, provider.ErrPromptTooLong, provider.ErrImageInvalid,
+				provider.ErrBadParams, provider.ErrPassthrough:
+				// 内容拦截 / 上下文超限 / 图片无效 / 出站 body 不合格 / 请求级拒绝：
+				// 不冷却不熔断不计错，直接透传原文回客户端。
 				// 这些是请求内容或请求形态问题，与账号健康无关，轮转白费时间且浪费好号配额。
+				//
+				// ⚠️ ErrImageInvalid 与 ErrBadParams 是 2026-10-17 补入的：两者的 ErrKind 注释
+				// 早就写着「请求级错误，不罚号不轮转，透传原文」，但本 case 漏了它们 ⇒ 落到
+				// default 做 NoteError 计数，等于拿客户端的问题惩罚健康账号。本地拒绝型渠道
+				// （monkeycode / loomy / raccoon / minimax）最容易触发这条路径。
 				transparentError(w, status, respBody)
 				return
-			case provider.ErrWafBlock, provider.ErrAccountFault, provider.ErrModelBlocked:
-				// 账号级风控/故障/模型不存在：软冷却，不累计错误计数。
+			case provider.ErrModelBlocked:
+				// (账号,模型) 级负缓存避让 —— 兑现 provider.go:193 的注释承诺。
+				//
+				// ⚠️ 2026-10-18 修正：本 case 原先与 ErrWafBlock/ErrAccountFault 合并，
+				// 走 Pool.Cooldown(uid) **冻结整个账号**。后果是「一个模型在上游不存在」
+				// 会拖垮同一账号下的所有模型：officeace 里 glm-5.3-flash 上游回 404，
+				// 三个账号接连被 model_blocked 冻结 60s，整条渠道 503。
+				// 而 provider.go:193 对 ErrModelBlocked 的定义明明写着「(账号,模型) 负缓存避让」。
+				// 现在改为只冻这一个 (账号,模型)；CooldownModel 内部在「≥2 个模型同时冷」
+				// 时才升级为整号冷却（见 pool.go 的同款注释），那时才是真正的账号问题。
+				escalated := rt.Pool.CooldownModel(acct.UID, model, h.cfg.SoftCooldown, kind.String())
+				log.Printf("model cooldown platform=%s uid=%s model=%s escalated=%v reason=%s",
+					rt.Kind, acct.UID, model, escalated, kind)
+				transparentError(w, status, respBody)
+				return
+			case provider.ErrWafBlock, provider.ErrAccountFault:
+				// 账号级风控/授权故障：软冷却，不累计错误计数。
 				rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, kind.String())
 				if kind != provider.ErrAccountFault {
 					transparentError(w, status, respBody)
 					return
 				}
+			case provider.ErrClient:
+				// 请求内容/形态类 4xx（如 workbuddy 11148 工具调用与结果不配对）：
+				// 错误跟着请求体走，换号必然同样拒收——不累计错误计数。否则一个
+				// 坏会话的客户端重试风暴会在几分钟内把全池账号记满冷却（阈值默认 3），
+				// 面板呈现「渠道自己挂了」假象，且诱发无意义的模型降级链触发。
+				// 仅轮转以兼容「同模型不同账号权益差异」场景；候选耗尽后透传最后
+				// 错误（与上游分类器注释「BadParams：不罚号但仍轮转」对齐）。
 			case provider.ErrServer:
-				if rt.NoCooldownOnServerError {
-					// 该渠道声明 5xx 为上游网关抖动（账号本身健康），
-					// 不计入账号错误，避免一夜抖动把所有账号冷却。
-					log.Printf("upstream server error platform=%s uid=%s status=%d（不计入账号错误）",
+				// 上游 5xx = 服务端故障，与账号健康无关 ⇒ **不计入账号错误**。
+				//
+				// ⚠️ 2026-10-18 翻转（原先只有声明 NoCooldownOnServerError 的渠道豁免）：
+				// 实测事故（lobsterai）—— 上游对带 developer 角色的请求返回 500，
+				// ErrServer 可轮换 ⇒ 一次客户端请求打 3 个账号各 +1 errCount，
+				// 而 err_threshold 默认 3 ⇒ **重试一次就把三个健康账号全冷却 10 分钟**，
+				// 期间整条渠道 503。账号本身完全健康（积分/签到/session 全正常）。
+				//
+				// 判据：5xx 的语义就是「服务端出问题了」，记到客户端凭据头上既不合因果，
+				// 也会把一次上游故障放大成整条渠道下线。轮转保留（ErrServer 仍 Rotatable），
+				// 「换个账号重试」的机会还在，只是不再拿 5xx 惩罚账号。
+				//
+				// 逃生门：NoCooldownOnServerError 字段保留，但语义不变（仍表示「不豁免」），
+				// 仅用于审计/文档层面标注渠道差异；真正的计数开关由 CountServerErrorAsAccountFault
+				// 单独表达，当前无一渠道开启。
+				if rt.CountServerErrorAsAccountFault {
+					rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					log.Printf("upstream server error platform=%s uid=%s status=%d（渠道显式要求计入账号错误）",
 						rt.Kind, acct.UID, status)
 				} else {
-					rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
+					log.Printf("upstream server error platform=%s uid=%s status=%d（不计入账号错误）",
+						rt.Kind, acct.UID, status)
 				}
 			default:
 				rt.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
@@ -599,22 +909,30 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				lastErr = fmt.Errorf("upstream %s (http %d): %s", kind, status, truncateBody(respBody))
 				lastStatus = status
 				lastBody = respBody
+				lastKind = kind
 				continue
 			}
 			transparentError(w, status, respBody)
 			return
 		}
 		defer rc.Close()
+		// 轮转内换号成功：清掉前面 status>=400 分支写进统计行的状态码。
+		// 否则「A 号 429、B 号成功」的请求会在运行统计/请求日志里记成 429——
+		// 出口 defer 只在 Status==0 时补 200，而该字段一旦被写就不会自愈。
+		// 模型饱和（14003/6004）是多账号渠道的高频形态，统计失真会让面板看不出
+		// 降级是否生效，故与请求内降级路径的 statRow.Status 清零同源处理。
+		statRow.Status = 0
 		rt.Pool.NoteSuccess(acct.UID)
 		h.stickySuccess(rt)
-		if peek.Stream {
-			usage, serr := rt.Upstream.Stream(w, rc, clientModel)
+		if stream {
+			usage, serr := rt.Upstream.Stream(w, rc, dispModel)
+			cu := cacheUsageOf(usage) // 缓存命中（上游未上报时 reported=false，面板显示「—」）
 			// 记 token 流水（成功请求口径；usage 缺失记 0 token 仅计请求数）。
 			// 记账失败不干扰主流程——锦上添花功能。
 			if h.ledger != nil {
 				pt, ct, src := usageTokens(usage)
 				h.ledger.AppendUsage(ledger.UsageEntry{Ch: rt.Kind.String(), UID: acct.UID,
-					Model: stripChannel(clientModel), PT: pt, CT: ct, Src: src})
+					Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src})
 			}
 			// 运行统计：模型维度记账（有 usage 才计，对齐 sidecar 的 u.found 语义）。
 			// 吞吐仅在流式下有意义：genSec = 总耗时 − TTFB；引擎内对 ≤50ms 的样本只计 TTFB。
@@ -622,7 +940,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				pt, ct, _ := usageTokens(usage)
 				if pt > 0 || ct > 0 {
 					gen := time.Since(sw.start).Seconds() - float64(sw.ttfbMs)/1000
-					h.stats.AddUsage(clientModel, pt, ct, usageCredit(usage), sw.ttfbMs, gen, time.Now())
+					h.stats.AddUsage(acctModel, pt, ct, usageCredit(usage), sw.ttfbMs, gen, cu.cached, cu.reported, time.Now())
 					statRow.Tok = ct
 					if gen > 0 {
 						statRow.TokPerSec = float64(ct) / gen
@@ -631,8 +949,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				statRow.Credit = usageCredit(usage)
 			}
 			if serr != nil {
-				// 上游中断/空流已尽力透传，错误仅在日志可见
-				log.Printf("stream relay end platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+				// 思考链死循环（发癫）命中：模型/请求级问题，不罚账号（换号必然复现），
+				// 错误帧已透传给客户端，由下游 agent 自行重试。仅记日志。
+				var lge *loopguard.Error
+				if errors.As(serr, &lge) {
+					log.Printf("reasoning loop intercepted platform=%s uid=%s model=%s kind=%s reason=%s",
+						rt.Kind, acct.UID, clientModel, lge.Hit.Kind, lge.Hit.Reason)
+					return
+				}
+				// 上游中断/空流已尽力透传，错误仅在日志可见。
+				// 必须带耗时与 TTFB（R58）：只有这个数字能把几种原因分开——
+				// 耗时 ≈ 空闲阈值（idle.DefaultTimeout 300s / 各渠道 IdleReader 90s）
+				// 且 TTFB 远小于它 ⇒ 看门狗掐的；耗时远小于阈值 ⇒ 上游自己断的。
+				// 原先只记 err，两种完全同形，定位只能靠猜。
+				log.Printf("stream relay end platform=%s uid=%s model=%s elapsed=%.1fs ttfb=%dms err=%v",
+					rt.Kind, acct.UID, clientModel, time.Since(sw.start).Seconds(), sw.ttfbMs, serr)
 				// 流内业务错误（traework SOLO 的 event:error，如 3004 限流）：
 				// HTTP 200 与响应头早已发出，无法在同一请求内换号重试；唯一补救是把
 				// 中招账号冷却掉——下次请求挑号会自动换到别的账号（粘性路由见
@@ -642,16 +973,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					kind := sec.Kind()
 					switch kind {
 					case provider.ErrSoftRate:
+						// 单号渠道（当前仅一个账号，如 loomy/小浣熊）：冷却 = 整条渠道下线，
+						// 反不如透传——客户端已通过 SSE 收到上游原始限流错误（3004/429），
+						// 会自行退避重试；与非流式「单账号不罚账号」口径一致。
+						// SingleAccount 渠道（oczen）官方已有完整豁免语义，保持官方原样不重复覆盖。
+						if len(rt.Pool.List()) <= 1 && !rt.SingleAccount {
+							log.Printf("stream error passthrough platform=%s uid=%s kind=%s（单号渠道不罚账号，客户端自行重试）",
+								rt.Kind, acct.UID, kind)
+							break
+						}
 						rt.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "stream business error: "+serr.Error())
 						log.Printf("stream error cooled platform=%s uid=%s kind=%s cooldown=%s",
 							rt.Kind, acct.UID, kind, h.cfg.SoftCooldown)
 					case provider.ErrHardCredit:
-						rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.cfg.HardCooldown, "stream business error: "+serr.Error())
+						if len(rt.Pool.List()) <= 1 {
+							// 单号渠道：余额/权益不足透传原文，客户端/用户直接看到真实原因（如充值），
+							// 而不是被 503 掩盖成「渠道不可用」。账号本身不动，仅冷却「账号×该模型」，
+							// 下一次请求挑号即「模型全冷」，自动走降级链顶替。
+							rt.Pool.CooldownModel(acct.UID, model, h.hardCooldown(), "stream 402 权益不足")
+							log.Printf("stream error model-cooldown platform=%s uid=%s model=%s kind=%s（单号渠道仅冷却该模型，原文透传）",
+								rt.Kind, acct.UID, model, kind)
+							break
+						}
+						rt.Pool.Cooldown(acct.UID, pool.CoolHard, h.hardCooldown(), "stream business error: "+serr.Error())
 						log.Printf("stream error cooled platform=%s uid=%s kind=%s cooldown=%s",
-							rt.Kind, acct.UID, kind, h.cfg.HardCooldown)
+							rt.Kind, acct.UID, kind, h.hardCooldown())
 					case provider.ErrSessionDead:
-						rt.Pool.Disable(acct.UID, "stream business error: session dead")
-						log.Printf("stream error disabled platform=%s uid=%s", rt.Kind, acct.UID)
+						// 登录态失效：标记 SessionDead（挑号跳过 + 面板徽标），不再混入停用（#134）
+						rt.Pool.MarkSessionDead(acct.UID, serr.Error())
 					default:
 						// 其余流内错误（如请求级拒绝）不罚账号，只记日志。
 						log.Printf("stream error ignored platform=%s uid=%s kind=%s",
@@ -661,8 +1010,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		resp, err := rt.Upstream.Aggregate(rc, clientModel)
+		resp, err := rt.Upstream.Aggregate(rc, dispModel)
 		if err != nil {
+			// 流内嵌错误（如 qwenwork 402 权益不足）此时已带分类：模型级冷却，
+			// 下一次请求挑号即「模型全冷」，自动走降级链顶替；本次仍返回错误。
+			var asec provider.StreamErrorClassifier
+			if errors.As(err, &asec) && asec.Kind() == provider.ErrHardCredit {
+				rt.Pool.CooldownModel(acct.UID, model, h.hardCooldown(), "402 权益不足")
+				log.Printf("model cooldown (aggregate 402) platform=%s uid=%s model=%s cooldown=%s",
+					rt.Kind, acct.UID, model, h.hardCooldown())
+			}
 			statRow.Status = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
@@ -670,8 +1027,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if h.ledger != nil {
 			u, _ := resp["usage"].(map[string]any)
 			pt, ct, src := usageTokens(u)
+			cu := cacheUsageOf(u)
 			h.ledger.AppendUsage(ledger.UsageEntry{Ch: rt.Kind.String(), UID: acct.UID,
-				Model: stripChannel(clientModel), PT: pt, CT: ct, Src: src})
+				Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src})
 		}
 		writeJSON(w, http.StatusOK, resp)
 		// 运行统计：必须在写回之后——此刻 statWriter 才记到首字节，TTFB 为真值；
@@ -682,7 +1040,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			pt, ct, _ := usageTokens(u)
 			if pt > 0 || ct > 0 {
 				gen := time.Since(sw.start).Seconds() - float64(sw.ttfbMs)/1000
-				h.stats.AddUsage(clientModel, pt, ct, usageCredit(u), sw.ttfbMs, gen, time.Now())
+				cu := cacheUsageOf(u)
+				h.stats.AddUsage(acctModel, pt, ct, usageCredit(u), sw.ttfbMs, gen, cu.cached, cu.reported, time.Now())
 				statRow.Tok = ct
 			}
 			statRow.Credit = usageCredit(u)
@@ -694,13 +1053,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 候选耗尽但轮换中有上游错误：优先透传最后一个上游原始响应（保持上游语义，
 	// 如 429+6004 重置时间；本次请求确实逐号尝试过，包装成 503 反而丢信息）。
 	if lastStatus > 0 && lastBody != nil {
-		transparentError(w, lastStatus, lastBody)
+		// 候选耗尽：不在此透传——交回调用方判定（方案 B 积分耗尽时按降级链重入一次，
+		// 否则原样透传；透传语义见上方注释）。
+		res = rotationResult{done: false, lastKind: lastKind, lastStatus: lastStatus, lastBody: lastBody}
 		return
 	}
 	statRow.Status = http.StatusServiceUnavailable
 	sts := rt.Pool.List()
 	now := time.Now()
-	var bound, disabled, cooling, modelAvail int
+	var bound, disabled, cooling, sessionDead, modelAvail int
 	var earliest time.Time // 全池对该模型最早的解冻时刻（账号级与模型级冷却取最小）
 	consider := func(t time.Time) {
 		if t.After(now) && (earliest.IsZero() || t.Before(earliest)) {
@@ -710,6 +1071,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	for _, s := range sts {
 		if s.Disabled {
 			disabled++
+			continue
+		}
+		// ⚠️ 2026-10-18 补 sessionDead：登录态失效的账号原先**被计入 bound（可用账号）**，
+		// 于是 503 文案说「其余余额耗尽或出错」，把「需要重新登录」这个唯一可行动的
+		// 结论彻底掩盖掉（MonkeyCode 实测：用户看到的是"余额耗尽"，实际要重登）。
+		// pool.healthy() 早已把 sessionDead 视为不健康（pool.go:103），此处统计口径对齐它。
+		if s.SessionDead {
+			sessionDead++
 			continue
 		}
 		if s.Cooling {
@@ -749,21 +1118,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if noLoginChannel(rt.Kind) {
 			hint = "该渠道无需登录，稍后重试即可（若持续失败请查看日志）"
 		}
+		// 粘贴 Key 型渠道（cline）没有「重新登录」这个动作：Key 不过期也不轮换，
+		// 被禁用只会是「Key 无效/已被删除」，唯一补救是换一把有数 Key 粘进来。
+		// 照搬「需重新登录」会把用户引到一个不存在的入口（R41 同族的文案误导）。
+		if keyPasteChannel(rt.Kind) {
+			hint = fmt.Sprintf("请在面板粘贴一把有效的 %s API Key（sk_…，在 app.cline.bot → Account / API Keys 创建）", rt.Kind)
+		}
 		// 多数是限流冷却而非登录态问题：给出最早解冻时间，重登提示仅在无任何冷却时兜底。
 		if cooling > 0 && !earliest.IsZero() {
 			hint = fmt.Sprintf("最早约 %s 解冻（多为限流冷却，到点自动恢复；若长时间未恢复再检查登录态）", formatUnfreeze(earliest))
 		}
+		// 登录态失效优先于限流文案：这是唯一「用户自己动手就能恢复」的原因，
+		// 被限流文案盖住会让人白等（2026-10-18 MonkeyCode 实测的误导）。
+		if sessionDead > 0 && !noLoginChannel(rt.Kind) && !keyPasteChannel(rt.Kind) {
+			hint = fmt.Sprintf("%d 个账号登录态已失效，需重新登录后才能恢复", sessionDead)
+		}
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
-			fmt.Sprintf("渠道 %s 的 %d 个账号当前全部不可用（禁用 %d / 冷却 %d）：可在面板查看原因；%s",
-				rt.Kind, len(sts), disabled, cooling, hint))
+			fmt.Sprintf("渠道 %s 的 %d 个账号当前全部不可用（禁用 %d / 冷却 %d / 登录态失效 %d）：可在面板查看原因；%s",
+				rt.Kind, len(sts), disabled, cooling, sessionDead, hint))
 		return
 	}
-	msg := fmt.Sprintf("渠道 %s 暂无可用账号（共 %d 个：禁用 %d / 冷却 %d；其余余额耗尽或出错）",
-		rt.Kind, len(sts), disabled, cooling)
+	msg := fmt.Sprintf("渠道 %s 暂无可用账号（共 %d 个：禁用 %d / 冷却 %d / 登录态失效 %d；其余余额耗尽或出错）",
+		rt.Kind, len(sts), disabled, cooling, sessionDead)
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	return // 裸 return：携带命名结果 res（done=true——诊断引导已把响应写完）
 }
 
 // formatUnfreeze 解冻时刻的可读格式：24h 内只报时刻（HH:MM），更远带日期。
@@ -780,23 +1161,29 @@ func formatUnfreeze(t time.Time) string {
 
 // noLoginChannel 报告渠道是否「无登录概念」（不存在凭证文件、也无重登入口）。
 // 用于把「去面板重新登录」这类引导文案限定在真正适用的渠道上，
-// 避免匿名通道（oczen）被误导去找一个不存在的登录按钮。
-func noLoginChannel(k provider.Kind) bool { return k == provider.Oczen }
+// 避免免密渠道（oczen / kilo）被误导去找一个不存在的登录按钮。
+func noLoginChannel(k provider.Kind) bool { return k == provider.Oczen || k == provider.Kilo }
+
+// keyPasteChannel 报告渠道凭据是否「由用户从官方站点自行创建后粘贴进来」（而非登录编排取得）。
+// 这类渠道的引导文案必须指向「粘贴新 Key」而不能说「重新登录」：
+// cline 的官方 API Key 不过期、不轮换，被禁用只会是 Key 本身无效/被删。
+func keyPasteChannel(k provider.Kind) bool { return k == provider.Cline }
 
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
-	parts := strings.SplitN(strings.TrimSpace(model), "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / workbuddyai/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qodercom/<model> / qwenwork/<model> / glm/<model> / oczen/<model>")
+	// 解析与 provider.PublicModelID 同源：既接受 `<渠道>/<上游ID>`，也接受上游 ID 自带命名空间的
+	// 直通形态（`cline-free/*`）——后者首段不是渠道名，必须整串当上游模型名（决议 R59）。
+	kind, upstream, ok := provider.SplitModelID(model)
+	if !ok {
+		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / workbuddyai/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qodercom/<model> / qwenwork/<model> / glm/<model> / oczen/<model> / kilo/<model> / minimax/<model> / lobsterai/<model> / zcode/<model> / gemini/<model> / codearts/<model>；Cline 免费池直接用上游 ID（cline-free/<model>）")
 	}
-	kind := provider.Kind(parts[0])
-	rt := h.cfg.Runtimes[kind]
+	rt := h.getRuntime(kind)
 	if rt == nil || rt.Pool == nil || rt.Upstream == nil {
 		return nil, "", fmt.Errorf("provider %q is not configured", kind)
 	}
 	if len(rt.Pool.List()) == 0 {
 		return nil, "", fmt.Errorf("provider %q has no account", kind)
 	}
-	return rt, parts[1], nil
+	return rt, upstream, nil
 }
 
 // usageTokens 从 OpenAI usage 对象提 prompt/completion tokens；
@@ -826,13 +1213,91 @@ func numField(u map[string]any, keys ...string) int64 {
 	return 0
 }
 
-// stripChannel 去掉模型名的 channel/ 前缀（"workbuddy/glm-5.2" → "glm-5.2"），
-// 供流水按渠道内裸模型名聚合；无前缀时原样返回。
-func stripChannel(model string) string {
-	if i := strings.IndexByte(model, '/'); i >= 0 {
-		return model[i+1:]
+// ledgerModelOf 把客户端模型 ID 归一为流水里的模型名（= 上游模型名）。
+// 与 provider.UpstreamModelOf 同源：新旧写法（cline-free/x 与 cline/cline-free/x）
+// 必须落同一行，否则同一模型会在用量榜上裂成两行；裸名原样返回。
+func ledgerModelOf(clientModel string) string { return provider.UpstreamModelOf(clientModel) }
+
+// modelHasCapacity 报告 rt 渠道此刻是否有账号能承载 model。
+//
+// 一次 Pool.List() 得出答案，口径与 no_healthy_account 的「模型全冷」分支一致：
+// 跳过禁用/整号冷却的账号后，看是否还有账号不在该模型的模型级冷却中
+// （pool.statusOf 已剔掉过期条目，此处再比一次到期时间属防御）。
+//
+// 注意本函数对「整渠道全灭」（无任何健康账号）同样返回 false——
+// 这正是降级链该顶上的两种形态（模型全冷 / 整渠道全灭），调用方不得
+// 再额外要求「渠道内有健康账号」才降级（R54，PR #127 修正的旧判据）。
+func modelHasCapacity(rt *Runtime, model string) bool {
+	now := time.Now()
+	for _, s := range rt.Pool.List() {
+		if s.Disabled || s.Cooling {
+			continue
+		}
+		if t, ok := s.ModelCooling[model]; ok && t.After(now) {
+			continue
+		}
+		return true
 	}
-	return model
+	return false
+}
+
+// pickModelFallback 模型降级链解析：请求模型在本渠道已无账号可承载时
+// （两种形态——①「模型全冷」：渠道内有健康账号，但该模型在全部账号上处于
+// 模型级限流冷却；②「整渠道全灭」：渠道内已无任何健康账号，含全部禁用与
+// pool 的「多模型接连限流升级整号冷却」）时，按规则顺序（规则间按配置顺序、
+// 链内按 To 顺序）找第一个有容量的备胎模型全路径 ID；无规则/无可用备胎返回空串。
+// 备胎允许跨渠道（To 为 "channel/model" 全路径，经 runtimeForModel 解析）——
+// 整渠道全灭时正需要跨渠道备胎顶上，而非直接 503。
+//
+// skipSameChannel=true：跳过与当前渠道相同的备胎候选（仍会继续往链后找跨渠道的）。
+// 只给「请求内重入」用——那里 429 可能只是账号级限流，同渠道兄弟模型共享同一批
+// 账号，重打一遍会二次撞墙，并可能把冷却粒度从模型级升级为账号级；入口降级传 false
+// （入口已知「该模型在本渠道全冷」，换同渠道兄弟模型正是链配置的本意）。
+//
+// 第二返回值 primaryAvail = 「原模型此刻有可用账号」，与降级与否无关，只给恢复探针用：
+// 旧实现「未降级就算恢复」会把两种情形谎报成已恢复——① 原模型仍全冷但备胎也没容量，
+// ② 整渠道无健康账号。仅面板事件记账受影响，但谎报会令「持续时长」失真。
+// 未配置规则时不做探测（守住「正常路由零开销」）：此时不会新增事件，
+// 代价是删规则后残留的进行中事件不会自动关闭（环形 200 条自然淘汰，重启即清）。
+func (h *Handler) pickModelFallback(rt *Runtime, model string, skipSameChannel bool) (string, bool) {
+	h.fbMu.RLock()
+	rules := h.fallbacks
+	h.fbMu.RUnlock()
+	if len(rules) == 0 {
+		return "", false
+	}
+	if modelHasCapacity(rt, model) {
+		return "", true // 未全冷：走原路由，并告知探针「容量已在」
+	}
+	// 未全冷之外（模型全冷 / 整渠道全灭）都继续往下遍历规则找备胎：
+	// 链内无容量的候选由 modelHasCapacity 跳过；同渠道候选是否跳过由入参决定。
+	for _, rule := range rules {
+		// 规则里的 from 与请求模型都要按同一套 ID 解析（R59：cline 的 `cline-free/x`
+		// 与旧写法 `cline/cline-free/x` 必须都能命中同一条规则）。
+		rk, rUp, rok := provider.SplitModelID(rule.From)
+		if !rok || rk != rt.Kind || rUp != model {
+			continue
+		}
+		for _, to := range rule.To {
+			to = strings.TrimSpace(to)
+			if to == "" {
+				continue
+			}
+			rt2, m2, err := h.runtimeForModel(to)
+			if err != nil || rt2 == nil {
+				continue
+			}
+			if skipSameChannel && rt2.Kind == rt.Kind {
+				// 同渠道备胎共享同一批账号：请求内 429 可能只是账号级限流，
+				// 重打一遍必然二次撞墙（详见调用点注释）。继续往链后找跨渠道候选。
+				continue
+			}
+			if modelHasCapacity(rt2, m2) {
+				return to, false
+			}
+		}
+	}
+	return "", false
 }
 
 // usageCredit 从 usage 对象取上游下发的单次积分（WorkBuddy 系会回；
@@ -890,7 +1355,67 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 	return json.Marshal(obj)
 }
 
-// normalizeToolTurnContent 把「content 为 null 或缺失」的工具轮消息补成空串。
+// applyEffort 思考强度档位注入收口：未传且命中面板配置（lookupEffort 精确未命中回退
+// 通配 `*`）时填入 reasoning_effort；键已存在（任意值含 null，客户端显式意图）不碰；
+// 未配置（空 map，未配置 = 常态）零开销直通。注入失败不中断——原样返回旧 body，
+// 让上游给出权威结果（同模型降级链「仅触发才干活」哲学，也与 rewriteModel 失败
+// 处理同套路）。
+func (h *Handler) applyEffort(body []byte, model string) []byte {
+	h.efMu.RLock()
+	ef, ok := lookupEffort(h.efforts, model)
+	h.efMu.RUnlock()
+	if !ok {
+		return body
+	}
+	nb, changed, err := injectEffortField(body, ef)
+	if err != nil {
+		log.Printf("effort 注入失败 %s: %v", model, err)
+		return body
+	}
+	if changed {
+		log.Printf("effort inject: %s -> %s", model, ef)
+		return nb
+	}
+	return body
+}
+
+// lookupEffort 思考强度映射查询：精确命中优先，未命中回退 `*` 全局默认；皆无 = 不注入。
+// 空 map / 空模型名一律未命中（调用方无需再加前置判断）。
+func lookupEffort(efforts map[string]string, model string) (string, bool) {
+	if len(efforts) == 0 || model == "" {
+		return "", false
+	}
+	if ef, ok := efforts[model]; ok {
+		return ef, true
+	}
+	ef, ok := efforts["*"]
+	return ef, ok
+}
+
+// injectEffortField 思考强度档位注入：请求体顶层**无** reasoning_effort 键时填入配置
+// 档位。整体 map 解析 → 增键 → Marshal，保留其余全部字段；顶层键已存在（任意值含
+// null——客户端显式意图）不碰，返回 changed=false。失败返回 error，调用方保持原样
+// 转发（绝不因注入失败中断请求）。
+func injectEffortField(body []byte, ef string) (nb []byte, changed bool, err error) {
+	var obj map[string]any
+	if err = json.Unmarshal(body, &obj); err != nil {
+		return nil, false, err
+	}
+	if obj == nil {
+		return nil, false, errors.New("body 不是 JSON 对象")
+	}
+	if _, ok := obj["reasoning_effort"]; ok {
+		return nil, false, nil
+	}
+	obj["reasoning_effort"] = ef
+	nb, err = json.Marshal(obj)
+	if err != nil {
+		return nil, false, err
+	}
+	return nb, true, nil
+}
+
+// normalizeToolTurnContent 把「content 为 null 或缺失」的 assistant / tool 消息补成空串。
 //
 // 上游（实测 qoder/deepseek-flash，2026-09-24）要求带 tool_calls 的 assistant
 // 消息必须携带**字符串** content，null 或字段缺失会让它整请求拒答，并且报一个
@@ -910,6 +1435,14 @@ func rewriteModel(body []byte, model string) ([]byte, error) {
 //
 // 放宽到 tool 角色一并处理：工具返回空内容时客户端同样可能给 null，上游对工具
 // 轮是同一套校验。
+//
+// 2026-10-11 追加（traecode/SOLO 实测）：**普通 assistant 消息**（无 tool_calls）
+// content 缺失同样会被整请求拒答，错误是 SOLO 流内 event:error 的
+// `4001 the param is invalid`。成因是 CodeBuddy 客户端在「思考中途被打断」时，
+// 会把半截思考存成 `{"role":"assistant","reasoning":"…"}`（无 content、无
+// tool_calls）；此后该会话每轮重放都带上这条空壳，于是每发必拒（同「中毒进
+// 历史」）。重放对照坐实：原样 → 0.6s 即 4001；删掉该条或补 content:"" → 均
+// 正常出流。故 assistant 一律补空串，不再以 tool_calls 为前提。
 func normalizeToolTurnContent(obj map[string]any) {
 	msgs, _ := obj["messages"].([]any)
 	for _, raw := range msgs {
@@ -919,12 +1452,7 @@ func normalizeToolTurnContent(obj map[string]any) {
 		}
 		role, _ := m["role"].(string)
 		switch role {
-		case "assistant":
-			// 只在真的带 tool_calls 时补：普通 assistant 消息 content=null 无证据会出问题。
-			if tc, ok := m["tool_calls"].([]any); !ok || len(tc) == 0 {
-				continue
-			}
-		case "tool":
+		case "assistant", "tool":
 		default:
 			continue
 		}
@@ -939,9 +1467,10 @@ func normalizeToolTurnContent(obj map[string]any) {
 // 供管理端（费率面板）复用，保证「模型列表」与「模型费率」基于同一份清单。
 // 注意：会触发上游网络请求（fetchRuntimeModels），费控面板场景用 CachedChannelModels 避免阻塞。
 func (h *Handler) ChannelModels() map[provider.Kind][]provider.ModelInfo {
-	out := make(map[provider.Kind][]provider.ModelInfo, len(h.cfg.Runtimes))
-	for _, k := range h.runtimeKinds() {
-		rt := h.cfg.Runtimes[k]
+	ks := h.runtimeKinds()
+	out := make(map[provider.Kind][]provider.ModelInfo, len(ks))
+	for _, k := range ks {
+		rt := h.getRuntime(k)
 		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 {
 			continue
 		}
@@ -957,9 +1486,10 @@ func (h *Handler) ChannelModels() map[provider.Kind][]provider.ModelInfo {
 // CachedChannelModels 返回各渠道生效的模型列表，仅用内存缓存/静态兜底，不触发上游网络请求。
 // 供费控面板等需要即时返回的场景使用（后台刷新比用户点面板快）。
 func (h *Handler) CachedChannelModels() map[provider.Kind][]provider.ModelInfo {
-	out := make(map[provider.Kind][]provider.ModelInfo, len(h.cfg.Runtimes))
-	for _, k := range h.runtimeKinds() {
-		rt := h.cfg.Runtimes[k]
+	ks := h.runtimeKinds()
+	out := make(map[provider.Kind][]provider.ModelInfo, len(ks))
+	for _, k := range ks {
+		rt := h.getRuntime(k)
 		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 {
 			continue
 		}
@@ -988,7 +1518,8 @@ func (h *Handler) InvalidateModels() {
 	dynamicModelsCache.fetched = time.Time{}
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
-	for _, rt := range h.cfg.Runtimes {
+	for _, k := range h.runtimeKinds() {
+		rt := h.getRuntime(k)
 		if rt == nil {
 			continue
 		}
@@ -1001,9 +1532,23 @@ func (h *Handler) InvalidateModels() {
 }
 
 func (h *Handler) runtimeKinds() []provider.Kind {
-	ks := make([]provider.Kind, 0, len(h.cfg.Runtimes))
+	h.runtimesMu.RLock()
+	customCopy := make(map[provider.Kind]bool, len(h.customRts))
+	for k := range h.customRts {
+		customCopy[k] = true
+	}
+	h.runtimesMu.RUnlock()
+
+	ks := make([]provider.Kind, 0, len(h.cfg.Runtimes)+len(customCopy))
+	seen := map[provider.Kind]bool{}
 	for k := range h.cfg.Runtimes {
 		ks = append(ks, k)
+		seen[k] = true
+	}
+	for k := range customCopy {
+		if !seen[k] {
+			ks = append(ks, k)
+		}
 	}
 	sort.Slice(ks, func(i, j int) bool { return ks[i] < ks[j] })
 	return ks
@@ -1058,6 +1603,19 @@ const softRateResetMaxCap = 24 * time.Hour
 // 按重置点解封，60s 软冷却过期后账号会被反复选中反复 429。解析失败/时长为非正值时
 // 回退默认 SoftCooldown。时间戳按 UTC+8 墙钟解析，与到期字段口径一致（AGENTS §6.18）。
 // 已知形态「2026-09-23 14:47:19」可能带「UTC+8」后缀，解析前剥掉。
+// hardCooldown 本次硬冷却（402 余额/权益不足）应持续多久。
+// 默认恒为 HardCooldown；装配层注入 HardCooldownFor 时按其计算（当前策略：
+// 截到下一个每日发奖窗口，见 config.HardCooldownFor）——qwenwork 每日 00:00
+// UTC+8 自动发额度，固定 12h 会把 19:07 的 402 锁到次日 07:07，白锁 7 小时。
+func (h *Handler) hardCooldown() time.Duration {
+	if h.cfg.HardCooldownFor != nil {
+		if d := h.cfg.HardCooldownFor(time.Now()); d > 0 {
+			return d
+		}
+	}
+	return h.cfg.HardCooldown
+}
+
 func (h *Handler) softRateCooldown(body string) time.Duration {
 	ts, ok := softRateResetTs(body)
 	if !ok {
@@ -1073,15 +1631,24 @@ func (h *Handler) softRateCooldown(body string) time.Duration {
 	return d
 }
 
-// softRateResetTs 提取「将在 <ts> 重置」中的时间戳（UTC+8 墙钟）；未命中返回 false。
+// softRateResetTs 提取限流响应体中的重置时间戳（UTC+8 墙钟）；未命中返回 false。
+// 命中形态：国内版「...将在 2026-09-23 14:47:19 UTC+8 重置...」；国际版
+// workbuddyai 6004「...usage will reset at 2026-10-14 12:00:00 UTC+8, ...」。
 func softRateResetTs(body string) (time.Time, bool) {
-	const marker = "将在 "
+	if ts, ok := softRateResetAt(body, "将在 ", " 重置"); ok {
+		return ts, true
+	}
+	return softRateResetAt(body, "will reset at ", ",")
+}
+
+// softRateResetAt 定位 marker 之后、endMarker 之前的时间戳并按 UTC+8 墙钟解析。
+func softRateResetAt(body, marker, endMarker string) (time.Time, bool) {
 	i := strings.Index(body, marker)
 	if i < 0 {
 		return time.Time{}, false
 	}
 	rest := body[i+len(marker):]
-	end := strings.Index(rest, " 重置")
+	end := strings.Index(rest, endMarker)
 	if end < 0 {
 		return time.Time{}, false
 	}

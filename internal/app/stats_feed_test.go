@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,21 +13,44 @@ import (
 )
 
 // TestExpiryDayAmount 临期喂入口径：可用条目按日归组，取最早到期日 + 当日合计。
-func TestExpiryDayAmount(t *testing.T) {
+// TestExpiryItems 守门：喂给引擎的必须是**逐条目 + 原始时刻**。
+//
+// 历史（2026-10-19 重构）：旧函数 expiryDayAmount 只返回「最早到期日 + 该日合计」，
+// 导致 ① 面板只能按日期分桶（今晚 00:00 失效被算成「明日到期」）；
+// ② 「7 日内到期」只统计最早那一天，漏掉同账号后续 20+ 个每日包。
+// 新函数 expiryItems 保留每条原始 ExpireAt，分桶交给 provider.ExpireBucketOf。
+func TestExpiryItems(t *testing.T) {
 	items := []provider.ResourceItem{
 		{Remain: 100, ExpireAt: "2026-10-08T00:00:00+08:00", Usable: true},
 		{Remain: 50, ExpireAt: "2026-10-08T00:00:00+08:00", Usable: true},
 		{Remain: 30, ExpireAt: "2026-10-05T00:00:00+08:00", Usable: true},
-		{Remain: 999, ExpireAt: "2026-10-09T00:00:00+08:00", Usable: false}, // 不可用：不计
-		{Remain: 0, ExpireAt: "2026-10-01T00:00:00+08:00", Usable: true},    // 零额度：不计
-		{Remain: 88, ExpireAt: "", Usable: true},                            // 无到期日：不计
+		{Remain: 999, ExpireAt: "2026-10-09T00:00:00+08:00", Usable: false},               // 不可用：不计
+		{Remain: 0, ExpireAt: "2026-10-01T00:00:00+08:00", Usable: true},                  // 零额度：不计
+		{Remain: 88, ExpireAt: "", Usable: true},                                          // 无到期日：不计
+		{Remain: 77, ExpireAt: "2026-10-10T00:00:00+08:00", Usable: true, InfoOnly: true}, // 仅展示：不计
 	}
-	day, amount := expiryDayAmount(items)
-	if day != "2026-10-05" || amount != 30 {
-		t.Fatalf("最早日+合计错误：day=%s amount=%d", day, amount)
+	got := expiryItems(items)
+	if len(got) != 3 {
+		t.Fatalf("应保留 3 条（可消耗+有剩余+带到期），实际 %d: %+v", len(got), got)
 	}
-	if day, amount := expiryDayAmount(nil); day != "" || amount != 0 {
-		t.Fatalf("空条目应返回空值，实际 day=%s amount=%d", day, amount)
+	// 时刻必须原样保留（不得截成日期）：这是「按真实时分秒分桶」的前提
+	for _, e := range got {
+		if len(e.At) < 20 || !strings.Contains(e.At, "T") {
+			t.Fatalf("ExpireAt 被截断了：%q", e.At)
+		}
+	}
+	// 同日多条各自保留（不合并）——合并会让「逐条目累加」退化回「每账号最早日」
+	sameDay := 0
+	for _, e := range got {
+		if strings.HasPrefix(e.At, "2026-10-08") {
+			sameDay++
+		}
+	}
+	if sameDay != 2 {
+		t.Fatalf("同日 2 条应各自保留，实际 %d", sameDay)
+	}
+	if got := expiryItems(nil); len(got) != 0 {
+		t.Fatalf("空条目应返回空切片，实际 %+v", got)
 	}
 }
 

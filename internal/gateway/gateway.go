@@ -162,12 +162,23 @@ func (g *Gateway) withAuth(next http.HandlerFunc) http.HandlerFunc {
 type chatRequest = map[string]any
 
 // callChat 把 Chat 请求投递给内层，返回其响应（流式 raw body / 非流式已解析）。
+//
+// 降级标注头必须在此统一转写：两个兼容端点都经由本函数拿内层响应，而外层响应体
+// 是**重建**的（model 字段按客户端请求名回填，见 R15 口径），不搬该头就等于静默换模型。
+// 调用时机在设计上就安全：本函数在两条路径的首个 WriteHeader 之前。
 func (g *Gateway) callChat(w http.ResponseWriter, r *http.Request, req chatRequest, stream bool) (*innerResult, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	return g.call(r.Context(), "/v1/chat/completions", body, g.key())
+	res, err := g.call(r.Context(), "/v1/chat/completions", body, g.key())
+	if err != nil {
+		return nil, err
+	}
+	if v := res.Header.Get("X-Model-Fallback"); v != "" {
+		w.Header().Set("X-Model-Fallback", v)
+	}
+	return res, nil
 }
 
 // readChatResponse 读取内层非流式响应，返回 (状态码, 原始 body)。

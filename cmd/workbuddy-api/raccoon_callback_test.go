@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -94,20 +96,24 @@ func TestRaccoonCallbackHandlerBehavior(t *testing.T) {
 		t.Fatalf("非法深链应 handled=true 且落盘成功（解析错误写进 Err），得到 handled=%v err=%v", handled, err)
 	}
 
-	// 正常深链：落盘后可被 raccoon.LoadCallback 读回，且 code/state 正确。
+	// 正常深链：落盘成功（载荷文件含 code/state，且不含原始深链）。
 	const dl = "office-raccoon://auth/callback?code=ABC123&state=st1"
 	handled, err := handleRaccoonCallback([]string{raccoon.CallbackFlag, dl})
 	if !handled || err != nil {
 		t.Fatalf("正常深链应 handled=true 且无错，得到 handled=%v err=%v", handled, err)
 	}
-	p, ok, err := raccoon.LoadCallback("")
-	if err != nil {
-		t.Fatalf("LoadCallback: %v", err)
+	raw, rerr := os.ReadFile(filepath.Join(raccoon.StateDir(""), raccoon.CallbackFileName))
+	if rerr != nil {
+		t.Fatalf("回调未落盘（SaveCallback 未生效）：%v", rerr)
 	}
-	if !ok {
-		t.Fatalf("回调未落盘（SaveCallback 未生效）")
+	var p raccoon.CallbackPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("回调文件应为合法 JSON：%v", err)
 	}
 	if p.Code != "ABC123" || p.State != "st1" || p.Err != "" {
 		t.Fatalf("回调内容不符：%+v", p)
+	}
+	if strings.Contains(string(raw), "office-raccoon://") {
+		t.Fatalf("回调文件不应保存原始深链：%s", raw)
 	}
 }

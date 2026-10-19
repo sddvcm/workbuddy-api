@@ -11,8 +11,10 @@ import (
 	"workbuddy-api/internal/provider"
 )
 
-// TestCanonicalSessionID 会话头必须是官方形状 ses_<12位小写hex><14位Base62>，
-// 否则上游回 403 FreeTierError（2026-09-16 起的闸门）。
+// TestCanonicalSessionID 会话头须为官方形状+官方编码
+// ses_<12位小写hex><14位Base62>，时间戳段须是 Identifier.descending() 编码
+// （末三位 0xFFF-counter，实测只接受 counter 1–63）。
+// 形状/编码不对，或摘要段（旧实现）→ 确定性重编码；官方签发的 descending ID 原样保留。
 func TestCanonicalSessionID(t *testing.T) {
 	got := canonicalSessionID("hello conversation")
 	if len(got) != 4+12+14 || !strings.HasPrefix(got, "ses_") {
@@ -23,6 +25,9 @@ func TestCanonicalSessionID(t *testing.T) {
 			t.Fatalf("时间戳段非小写 hex: %q", got)
 		}
 	}
+	if !descendingTimePartPattern.MatchString(got[4:16]) {
+		t.Fatalf("生成的 session 时间戳段非 descending 编码: %q", got)
+	}
 	// 稳定性：同一会话种子必须映射到同一 session（prompt cache 亲和）
 	if again := canonicalSessionID("hello conversation"); again != got {
 		t.Fatalf("不稳定：%q != %q", again, got)
@@ -31,10 +36,54 @@ func TestCanonicalSessionID(t *testing.T) {
 	if other := canonicalSessionID("another conversation"); other == got {
 		t.Fatalf("不同种子撞同一 session: %q", got)
 	}
-	// 已是官方形状则原样保留
-	official := "ses_0123456789abAbCdEfGhIjKlMn"
-	if canonicalSessionID(official) != official {
-		t.Fatalf("官方 session 未被保留: %q", canonicalSessionID(official))
+}
+
+// TestCanonicalSessionIDKeepsGenuineDescendingIDs 官方客户端签发的时间戳段
+// （末三位 0xFFF-counter）必须原样保留，保住 prompt cache 亲和。
+func TestCanonicalSessionIDKeepsGenuineDescendingIDs(t *testing.T) {
+	genuine := []string{
+		"ses_ecc5beb7cffe2U0aluUnb5nnpZ", // counter 1
+		"ses_ecc441adcffep73ndhq1lBqQim", // counter 2
+		"ses_f02a5a612ffepq6RK15QX04Se0", // counter 16
+		"ses_4892557ffffeDiICzp8gKhMR0u", // counter 48
+		"ses_ecc1f76c9fef3zWGdD1GSCEwPf",
+		"ses_ecc1f76c9fcf3zWGdD1GSCEwPf",
+		"ses_ecc1f76c9fce3zWGdD1GSCEwPf",
+	}
+	for _, id := range genuine {
+		if got := canonicalSessionID(id); got != id {
+			t.Fatalf("canonicalSessionID(%q) = %q, 应原样保留", id, got)
+		}
+	}
+}
+
+// TestCanonicalSessionIDReencodesForeignEncodings 外形对但编码外来（旧摘要段 /
+// 升序 ID）必须重编码成 descending 布局，否则上游 403 FreeTierError。
+func TestCanonicalSessionIDReencodesForeignEncodings(t *testing.T) {
+	foreign := []string{
+		"ses_133a414840012U0aluUnb5nnpZ", // 升序 ID（001 后缀）
+		"ses_ecc1f76c9f9b3zWGdD1GSCEwPf", // counter 100（9b1 后缀）
+		"ses_088a704c30424N5kWDK0snKFbd", // 旧摘要段布局
+	}
+	for _, id := range foreign {
+		got := canonicalSessionID(id)
+		if len(got) != 4+12+14 || !strings.HasPrefix(got, "ses_") {
+			t.Fatalf("canonicalSessionID(%q) = %q, 非规范外形", id, got)
+		}
+		if !descendingTimePartPattern.MatchString(got[4:16]) {
+			t.Fatalf("canonicalSessionID(%q) = %q, 时间戳段非 descending 编码", id, got)
+		}
+		if got == id {
+			t.Fatalf("canonicalSessionID(%q) 保留了外来编码", id)
+		}
+	}
+}
+
+// TestDescendingTimePartLayout 低 12 位恒为 0xFFE（counter 1 取反）。
+func TestDescendingTimePartLayout(t *testing.T) {
+	got := descendingTimePart([]byte{0, 0, 0, 0, 1, 0xFF})
+	if got[9:] != "ffe" {
+		t.Fatalf("descendingTimePart = %q, 末三位应为 ffe", got)
 	}
 }
 
@@ -155,16 +204,26 @@ func TestChatStreamRequestShape(t *testing.T) {
 	if got := gotH.Get("x-opencode-client"); got != "cli" {
 		t.Errorf("x-opencode-client 错误: %q", got)
 	}
-	for _, k := range []string{"x-opencode-session", "x-session-affinity", "X-Session-Id"} {
+	for _, k := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"} {
 		if got := gotH.Get(k); !strings.HasPrefix(got, "ses_") || len(got) != 30 {
 			t.Errorf("%s 非规范会话形状: %q", k, got)
 		}
 	}
-	if !strings.HasPrefix(gotH.Get("x-opencode-request"), "req_") {
-		t.Errorf("x-opencode-request 缺失: %q", gotH.Get("x-opencode-request"))
+	// 2026-10-14 起上游把 x-opencode-request 列为 403 触发头（见 R69/headered），
+	// 一旦发出即被拒；这里锁死「不得再发」。
+	if got := gotH.Get("x-opencode-request"); got != "" {
+		t.Errorf("不得发送 x-opencode-request（上游 2026-10-14 起对携带该头的请求回 403）: %q", got)
 	}
-	if !strings.HasPrefix(gotH.Get("x-opencode-project"), "prj_") {
-		t.Errorf("x-opencode-project 缺失: %q", gotH.Get("x-opencode-project"))
+	// project 必须是裸 40 位小写 hex（prj_ 前缀的规范形态会被拒 403）。
+	proj := gotH.Get("x-opencode-project")
+	if len(proj) != 40 || strings.HasPrefix(proj, "prj_") {
+		t.Errorf("x-opencode-project 必须是裸 40 位 hex（不得带 prj_ 前缀），实际: %q", proj)
+	}
+	for _, ch := range proj {
+		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+			t.Errorf("x-opencode-project 含非小写 hex 字符: %q", proj)
+			break
+		}
 	}
 	if gotBody["stream"] != true {
 		t.Errorf("请求体未强制 stream=true: %v", gotBody["stream"])
@@ -300,5 +359,55 @@ func TestAnonymousAuthShape(t *testing.T) {
 	}
 	if a.NeedsRefresh(365 * 24 * 60 * 60 * 1e9) {
 		t.Fatal("虚拟账号不应需要刷新（ExpiresAt 必须为远期值）")
+	}
+}
+
+// TestBaseSelectsLaneByCredential 基址必须按车道分流（R69）。
+//
+// 上游 2026-10-14 把 **keyless**（匿名 public）推理从 /zen 迁到 /inference，
+// 两条车道基址不再相同。issue #117 的现场就是「匿名走 /zen 恒 403」。
+// 显式 Base（测试注入）必须仍然优先，否则全部 httptest 用例会打到真上游。
+func TestBaseSelectsLaneByCredential(t *testing.T) {
+	c := New()
+	if got := c.base(); got != AnonymousBase || !strings.Contains(got, "/inference") {
+		t.Fatalf("匿名凭证必须走 AnonymousBase(/inference)，实际 %q", got)
+	}
+	c.SetAPIKey("sk-user-key")
+	if got := c.base(); got != DefaultBase {
+		t.Fatalf("自备 key 必须走 DefaultBase(/zen)，实际 %q", got)
+	}
+	c.SetAPIKey("")
+	if got := c.base(); got != AnonymousBase {
+		t.Fatalf("清空 key 后应回匿名车道，实际 %q", got)
+	}
+	// 显式 Base 优先于两条车道（测试注入 httptest 上游）。
+	c.Base = "http://127.0.0.1:1"
+	if got := c.base(); got != c.Base {
+		t.Fatalf("显式 Base 必须优先，实际 %q", got)
+	}
+}
+
+// TestClientProjectIDShape 伪装 project 头必须是官方 CLI 的**裸 40 位小写 hex**
+// （带 prj_ 前缀的规范 id 会被上游 403），且同一 session 恒定映射同一值
+// （prompt cache 亲和）。见 R69。
+func TestClientProjectIDShape(t *testing.T) {
+	s := canonicalSessionID("conv-a")
+	got := clientProjectID(s)
+	if len(got) != 40 {
+		t.Fatalf("project 必须是 40 位 hex，实际 %d 位: %q", len(got), got)
+	}
+	if strings.HasPrefix(got, "prj_") {
+		t.Fatalf("project 不得带 prj_ 前缀（上游拒绝该规范形态）: %q", got)
+	}
+	for _, ch := range got {
+		if !(ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f') {
+			t.Fatalf("project 必须全为小写 hex，实际含 %q: %q", ch, got)
+		}
+	}
+	if again := clientProjectID(s); again != got {
+		t.Fatalf("同一 session 必须稳定映射同一 project（prompt cache 亲和）: %q vs %q", got, again)
+	}
+	if other := clientProjectID(canonicalSessionID("conv-b")); other == got {
+		t.Fatal("不同 session 不应映射到同一 project")
 	}
 }

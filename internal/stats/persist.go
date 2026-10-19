@@ -28,10 +28,15 @@ type persistJSON struct {
 // modelPersist 单模型消耗落盘形态（与内存 modelEntry 同口径，字段一一对应）。
 // 性能四项缺省为零值 → 均值退化为「无样本」，前端显示 "—"，重启后新一轮请求
 // 自然重新采样（丢弃历史样本比显示半截均值更诚实）。
+// 缓存三项（Cr/CrCov/CrReqs）必须持久化：曾遗漏导致每次重启丢失今日缓存样本，
+// 面板「缓存」列大面积回退成「—」（2026-10-13 线上实测：workbuddyai 98%→—）。
 type modelPersist struct {
 	Reqs      int64   `json:"reqs"`
 	Tokens    int64   `json:"tokens"`
 	Credit    float64 `json:"credit"`
+	Cr        int64   `json:"cr,omitempty"`
+	CrCov     int64   `json:"cr_cov,omitempty"`
+	CrReqs    int64   `json:"cr_reqs,omitempty"`
 	TTFBSumMs int64   `json:"ttfb_sum_ms,omitempty"`
 	PerfCnt   int64   `json:"perf_cnt,omitempty"`
 	GenTokens int64   `json:"gen_tokens,omitempty"`
@@ -42,6 +47,7 @@ type modelPersist struct {
 func (mp modelPersist) toEntry() *modelEntry {
 	return &modelEntry{
 		reqs: mp.Reqs, tokens: mp.Tokens, credit: mp.Credit,
+		cr: mp.Cr, crCov: mp.CrCov, crReqs: mp.CrReqs,
 		ttfbSumMs: mp.TTFBSumMs, perfCnt: mp.PerfCnt,
 		genTokens: mp.GenTokens, genSec: mp.GenSec,
 	}
@@ -51,6 +57,7 @@ func (mp modelPersist) toEntry() *modelEntry {
 func fromEntry(e *modelEntry) modelPersist {
 	return modelPersist{
 		Reqs: e.reqs, Tokens: e.tokens, Credit: e.credit,
+		Cr: e.cr, CrCov: e.crCov, CrReqs: e.crReqs,
 		TTFBSumMs: e.ttfbSumMs, PerfCnt: e.perfCnt,
 		GenTokens: e.genTokens, GenSec: e.genSec,
 	}

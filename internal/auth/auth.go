@@ -46,6 +46,11 @@ type Auth struct {
 	// 导入器从客户端同一 bundle 目录的 baizhi-cookies.json 取得。
 	// 仅 MonkeyCode 用；其它渠道不用该字段。
 	BaizhiCookie string
+	// Extra 是渠道扩展凭据的通用承载袋（键值均字符串）。首例 officeace：
+	// base_url / account_id / user_id / access_key / secret_key / security_token /
+	// project_id / cred_expires / dpop_priv / region 等，均以字符串保存。
+	// 只增不减、向后兼容（旧凭证无该字段 → nil，各渠道自行判空）。仅该类渠道使用。
+	Extra        map[string]string `json:"extra,omitempty"`
 	UID          string
 	EnterpriseID string
 	Nickname     string
@@ -140,6 +145,8 @@ func Parse(raw []byte) (*Auth, error) {
 				ConsoleCookie string `json:"consoleCookie"`
 				// baizhiCookie 同上：百智云会话 Cookie（控制台会话的上游来源）
 				BaizhiCookie string `json:"baizhiCookie"`
+				// extra 渠道扩展凭据袋（officeace 等；其余渠道空）
+				Extra map[string]string `json:"extra"`
 			} `json:"auth"`
 			Account struct {
 				UID          string `json:"uid"`
@@ -166,6 +173,7 @@ func Parse(raw []byte) (*Auth, error) {
 			ConsoleCookie: n.Auth.ConsoleCookie,
 			// BaizhiCookie 同上（控制台会话的上游来源）
 			BaizhiCookie: n.Auth.BaizhiCookie,
+			Extra:        n.Auth.Extra,
 			UID:          n.Account.UID,
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
@@ -187,9 +195,11 @@ func Parse(raw []byte) (*Auth, error) {
 			ConsoleCookie string `json:"consoleCookie"`
 			// baizhiCookie 同上：百智云会话 Cookie（控制台会话的上游来源）
 			BaizhiCookie string `json:"baizhiCookie"`
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
+			// extra 渠道扩展凭据袋（officeace 等；其余渠道空）
+			Extra        map[string]string `json:"extra"`
+			UID          string            `json:"uid"`
+			EnterpriseID string            `json:"enterpriseId"`
+			Nickname     string            `json:"nickname"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -208,6 +218,7 @@ func Parse(raw []byte) (*Auth, error) {
 			SigningSecret: f.SigningSecret,
 			ConsoleCookie: f.ConsoleCookie,
 			BaizhiCookie:  f.BaizhiCookie,
+			Extra:         f.Extra,
 			UID:           f.UID,
 			EnterpriseID:  f.EnterpriseID,
 			Nickname:      f.Nickname,
@@ -250,6 +261,8 @@ func (a *Auth) saveAtomicLocked() error {
 			"consoleCookie": a.ConsoleCookie,
 			// baizhiCookie 同上：仅 MonkeyCode 用（百智云会话 Cookie）
 			"baizhiCookie": a.BaizhiCookie,
+			// extra 仅 officeace 等扩展渠道非空；其余渠道写空 map 无副作用
+			"extra": a.Extra,
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
@@ -268,11 +281,8 @@ func (a *Auth) saveAtomicLocked() error {
 	return os.Rename(tmp, a.FilePath)
 }
 
-// LoadDir 扫描 dir 下 workbuddy*.json，只收 wantRegion（"cn"/"global"）。
-// 解析失败与 region 不符的文件静默跳过（启动日志由调用方统计）。
-func LoadDir(dir, wantRegion string) ([]*Auth, error) { return LoadWorkBuddyDir(dir, wantRegion) }
-
 // LoadWorkBuddyDir 扫描 WorkBuddy 凭证。
+// 解析失败与 region 不符的文件静默跳过（启动日志由调用方统计）。
 func LoadWorkBuddyDir(dir, wantRegion string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
@@ -466,6 +476,25 @@ func LoadLoomyDir(dir string) ([]*Auth, error) {
 	return loadPrefixed(dir, "loomy")
 }
 
+// LoadClineDir 扫描 Cline 凭证（cline-*.json）。
+//
+// 凭据不来自登录编排，而是面板「粘贴官方 API Key」（见 app.SubmitClineKey）。
+// glob 边界已核：现存前缀 workbuddy* / workbuddyai- / trae- / qoder* / qodercn- /
+// qodercom- / qwenwork- / glm- / monkeycode- / raccoon- / loomy- 与 cline- 无包含关系。
+func LoadClineDir(dir string) ([]*Auth, error) {
+	return loadPrefixed(dir, "cline")
+}
+
+// LoadOfficeAceDir 扫描华为云果办 OfficeAce 渠道凭证（officeace-*.json）。
+// 与 cline 同为「导入型」渠道：凭据由面板从本机 OfficeAce 客户端文件发现后生成
+// （见 internal/officeace 的发现逻辑），或自助 OAuth 登录生成。
+// 上游模型网关是 OpenAI 兼容的华为 AgentArts 网关，故 accessToken 承载网关 Authorization 头
+// （Basic base64(AK:SK)）；其余扩展字段（base_url / 临时 AK-SK / refresh_token / DPoP 私钥）
+// 由 Parse 落到 Auth.Extra。
+func LoadOfficeAceDir(dir string) ([]*Auth, error) {
+	return loadPrefixed(dir, "officeace")
+}
+
 // loadPrefixed 按前缀扫描并解析凭证（供无登录编排的「导入型」渠道复用）。
 // 单个文件损坏时跳过而不整体失败——与既有 Load*Dir 的容错口径一致。
 func loadPrefixed(dir, prefix string) ([]*Auth, error) {
@@ -619,4 +648,81 @@ func jwtExpiry(token string) int64 {
 		return 0
 	}
 	return payload.Exp
+}
+
+// LoadMinimaxDir 扫描 MiniMax Code（中国版）渠道凭证（minimax-*.json）。
+//
+// 与 LoadTraeDir 同口径：解析失败或不可读的文件静默跳过（启动日志由调用方统计），
+// Kind 固定为 "minimax"，FilePath 指向来源文件（供 refresh 后 SaveAtomic 写回）。
+//
+// glob 边界：`minimax-*.json` 里的字面量 `-` 保证既不会被别的渠道吞并，也不会吞别人——
+//   - 现存前缀（workbuddy* / workbuddyai- / trae- / qoder* / qodercn- / qodercom- /
+//     qwenwork- / glm- / monkeycode- / raccoon- / loomy- / cline- / officeace-）都不以
+//     `minimax` 开头，故本 glob 不会命中它们的文件；
+//   - 反向同样安全：`minimax-*` 要求紧跟一个 `-`，所以将来若出现 `minimax2-*.json`
+//     （或 `minimaxpro-*.json`）之类的宽前缀渠道，**不会**被本加载器误收。
+//
+// 刻意**不**调 AdoptJWTExpiry：MiniMax 的 access token 不是 JWT（实测前缀 mmoat_、
+// 60 字符、0 个点；refresh_token 前缀 mmort_ 同样非 JWT），没有 `exp` 可读，
+// expiresAt 只能由登录 / 续期时的 `now + expires_in`（**单位秒**）写入。
+// 调它虽然是无害空操作（解析不出 exp 即返回 0），但会误导后来者以为这里有 JWT 兜底。
+func LoadMinimaxDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "minimax-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Auth
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		a, err := Parse(raw)
+		if err != nil {
+			continue
+		}
+		a.Kind, a.FilePath = "minimax", f
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// LoadLobsterAIDir 扫描 LobsterAI 渠道凭证（lobsterai-*.json）。
+//
+// 与 LoadMinimaxDir / LoadQwenWorkDir 同口径：解析失败或不可读的文件静默跳过
+// （启动日志由调用方统计），Kind 固定为 "lobsterai"，FilePath 指向来源文件
+// （供 refresh 后 SaveAtomic 写回 —— 不变量 20：refresh token 轮换后必须落盘）。
+//
+// glob 边界：`lobsterai-*.json` 里的字面量 `-` 保证既不会被别的渠道吞，也不吞别人——
+//   - 现存前缀（workbuddy* / workbuddyai- / trae- / qoder* / qodercn- / qodercom- /
+//     qwenwork- / glm- / monkeycode- / raccoon- / loomy- / cline- / officeace- /
+//     minimax-）没有一个以 `lobsterai` 开头，故本 glob 不会命中它们的文件；
+//     注意 `loomy-*.json` 虽同以 `lo` 开头，但本 glob 的字面量要求紧跟 `bsterai`，
+//     两者无包含关系；
+//   - 反向同样安全：`lobsterai-*` 要求紧跟一个 `-`，所以将来若出现 `lobsterai2-*.json`
+//     （或 `lobsteraiPro-*.json`）之类的宽前缀渠道，**不会**被本加载器误收
+//     （回归测试 TestSaveAuthRoundTripAndGlobBoundary 已锁死这一点）。
+//
+// 刻意**不**调 AdoptJWTExpiry：登录路径已把 expiresIn（秒）或 access token 的 JWT exp
+// 写进 ExpiresAt；只有"两条来源都拿不到"时 expiresAt 才为 0，那种情况调它也是无操作
+// （解析不出 exp 即返回 0），留在原地只会误导后来者以为这里另有 JWT 兜底。
+func LoadLobsterAIDir(dir string) ([]*Auth, error) {
+	files, err := filepath.Glob(filepath.Join(dir, "lobsterai-*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Auth
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		a, err := Parse(raw)
+		if err != nil {
+			continue
+		}
+		a.Kind, a.FilePath = "lobsterai", f
+		out = append(out, a)
+	}
+	return out, nil
 }
