@@ -32,6 +32,26 @@ type catalogModel struct {
 	SupportsReasoning  bool `json:"supportsReasoning"`
 	SupportsToolCall   bool `json:"supportsToolCall"`
 	DisabledMultimodal bool `json:"disabledMultimodal"`
+	// reasoning 档位声明（issue #96，形状对齐 dsh-workbuddyai-connect 实测类型）。
+	Reasoning *catalogReasoning `json:"reasoning"`
+}
+
+// catalogReasoning 目录 reasoning 对象（仅取可透传的权威字段；与 upstream 包同形状）。
+type catalogReasoning struct {
+	SupportedEfforts []string `json:"supportedEfforts"`
+	DefaultEffort    string   `json:"defaultEffort"`
+	// Effort 老式默认档字段（deepseek 系实测只有它没有列表），DefaultEffort 空时回退。
+	Effort             string `json:"effort"`
+	CanDisableThinking bool   `json:"canDisableThinking"`
+}
+
+// hasReasoningMeta 报告 reasoning 对象是否带任何档位信息（全空 = 视为未声明）。
+func (r *catalogReasoning) hasReasoningMeta() bool {
+	if r == nil {
+		return false
+	}
+	return len(provider.CleanEfforts(r.SupportedEfforts)) > 0 ||
+		strings.TrimSpace(r.DefaultEffort) != "" || strings.TrimSpace(r.Effort) != ""
 }
 
 // imageOK 判定该模型可否接收图像输入：
@@ -73,8 +93,8 @@ type catalogCache struct {
 	colors  map[string]string
 	fetched time.Time
 
-	v3      []catalogModel // /v3/config 全量模型面（不过滤）
-	v3OK    bool           // v3 探测是否成功过（失败不写缓存，避免负缓存住坏结果）
+	v3        []catalogModel // /v3/config 全量模型面（不过滤）
+	v3OK      bool           // v3 探测是否成功过（失败不写缓存，避免负缓存住坏结果）
 	v3Fetched time.Time
 }
 
@@ -106,7 +126,10 @@ func (c *Client) fetchCatalog(a *auth.Auth) ([]catalogModel, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		// 类型化错误：上层靠 errors.As 取分类才能 refresh + 重试（不变量 19），
+		// 裸 fmt.Errorf 会让模型/费率面的 401 自愈永远不生效（R79）。
+		return nil, &provider.Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode,
+			Msg: fmt.Sprintf("models api: %s", truncate(string(raw), 200))}
 	}
 	var env catalogResp
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -207,7 +230,9 @@ func (c *Client) fetchV3Catalog(a *auth.Auth) ([]catalogModel, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3 config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		// 同上：类型化错误（R79）。
+		return nil, &provider.Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode,
+			Msg: fmt.Sprintf("v3 config: %s", truncate(string(raw), 200))}
 	}
 	var env catalogResp
 	if err := json.Unmarshal(raw, &env); err != nil {
@@ -255,6 +280,10 @@ func mergeV3(v2 []catalogModel, v3 []catalogModel) ([]catalogModel, map[string]s
 			}
 			m.SupportsImages = vm.SupportsImages || m.SupportsImages
 			m.SupportsToolCall = vm.SupportsToolCall || m.SupportsToolCall
+			// 思考档位：v3 带则覆盖，v3 无则保留 v2（同「非空者优先」口径）
+			if vm.Reasoning.hasReasoningMeta() {
+				m.Reasoning = vm.Reasoning
+			}
 		}
 		if m.ID == "" || seen[m.ID] {
 			continue
@@ -447,12 +476,27 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
-		// 上游按**模型**限流（6004 / "switch to the other models"）：属请求级拒绝，
-		// **不得**按账号级冷却——否则该账号上其它还能用的模型一起被拖下水
-		// （issue #53：A 的 deepseek-v4.1-flash 撞每日上限后，A 的 gpt-5.6-luna 也不能用）。
-		// 透传原文让客户端按 Retry-After 自行退避或换模型，与 R16 单账号渠道同款哲学。
-		if strings.Contains(lower, "switch to the other models") || strings.Contains(lower, "usage exceeds frequency limit") {
-			return provider.ErrPassthrough
+		// 429（含按**模型**限额的 6004「usage exceeds frequency limit / switch to the
+		// other models」）一律软限流：handler 对 ErrSoftRate 走 CooldownModel，只冷却
+		// 「账号×该模型」到响应体重置点，同号其他模型不受牵连（issue #53 的担忧已由
+		// 模型级冷却化解），模型全冷时降级链自动顶替。历史上曾把 6004 归为
+		// ErrPassthrough 纯透传（当时只有账号级冷却这一种手段），但透传什么都不冷却，
+		// 降级链永不触发，客户端只能对着重置时间干等。
+		// 例外：积分耗尽（14018，msg 是复数 "Credits exhausted"——与 hardMarkers 的
+		// "credit exhausted" 差一个 s，429 分支在 hardMarkers 之前直接 return 时永远
+		// 漏匹配）是账号级余额问题而非限流：归软限流只冷却「账号×该模型」60s（body
+		// 无重置时间戳，回退 SoftCooldown），到期容量"恢复"，降级链永不触发，客户端
+		// 死循环吃 429（2026-09-23 起生产实录）。归 ErrHardCredit：账号级 12h 硬冷却
+		// （充值后 ReenableIfCredits 自动解冻），下一请求入口降级链正常顶替。
+		// 匹配防前缀误伤："code":140180 含子串 "code":14018——命中后下一字符须非
+		// 数字，防未来 14xxxx 新码误归 12h 账号硬冷却。
+		if idx := strings.Index(body, `"code":14018`); idx >= 0 {
+			if end := idx + len(`"code":14018`); end >= len(body) || body[end] < '0' || body[end] > '9' {
+				return provider.ErrHardCredit
+			}
+		}
+		if strings.Contains(lower, "credits exhausted") {
+			return provider.ErrHardCredit
 		}
 		return provider.ErrSoftRate
 	}
@@ -461,13 +505,10 @@ func Classify(status int, body string) provider.ErrKind {
 			return provider.ErrHardCredit
 		}
 	}
-	// 非 429 但 body 含限流文案 → 软限流
+	// 非 429 但 body 含限流文案 → 软限流（含「switch to the other models」的模型级
+	// 限额同此：handler 走 CooldownModel 冷却到重置点，不罚账号）。
 	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests") ||
 		strings.Contains(lower, "usage limit") || strings.Contains(lower, "请求过于频繁") {
-		// 同上：模型级限流不算账号问题。
-		if strings.Contains(lower, "switch to the other models") {
-			return provider.ErrPassthrough
-		}
 		return provider.ErrSoftRate
 	}
 	if status == http.StatusNotFound {

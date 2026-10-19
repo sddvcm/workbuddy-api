@@ -277,6 +277,38 @@ WorkBuddy 单渠道、wild-work 没有成长任务体系 —— 任何一方都�
 - panel 的任务领奖端点只在 `WebBase` 域提供，而 wild-work 只有 chat 与 billing
   两个域，不补上则领奖恒返回 400。
 
+### 上游同步记录：wild-work v2.6.2 → v2.9.3（2026-10-19，v0.2.0）
+
+基线追平 `rockswang/wild-work` 的 **v2.9.3**（143 个提交、390 个文件改动、
+约 +7.9 万行）。合并采用「树归一化 + 三方合并」：把上游 `cmd/wild-work/` →
+`cmd/workbuddy-api/`、模块名 `wild-work` → `workbuddy-api` 后再合，避免整仓重命名噪声。
+
+**本次吸收的上游能力**
+
+| 能力 | 说明 |
+|---|---|
+| 新渠道 | Cline、Kilo（免密免费池）、OfficeAce、Minimax、LobsterAI、ZCode、Gemini、CodeArts |
+| backuplink | 决议 R57：单渠道多上游地址的备用通道 |
+| 模型降级链 | `ModelFallback`：命中额度/限流时按规则透明换模型，客户端无感 |
+| 思考强度注入 | `ReasoningEfforts`：按模型注入 reasoning_effort，含 `*` 通配回退 |
+| 会话失效判定 | `SessionDead` + `MarkSessionDead`，配合会话粘性 |
+| 单账号渠道 | `SingleAccount`：无号可轮换时不冷却，原样透传上游错误 |
+| 风控与保护 | loopguard、WAF IP 级 fail-fast、模型级冷却 |
+| 凭据保护 | `internal/officeace` 的 DPAPI 读取（Windows 专属） |
+
+**本地保留、上游没有的部分**（合并时逐处保留）
+
+成长任务体系（`internal/upstream/growth*.go`、`desktop.go`、`mp_report.go`、
+`report.go`）、账号挑号策略（`internal/pool/strategy.go`、`max_rotate`）、
+会话粘性、模型列表的费率后缀（`internal/provider/modelsuffix.go`）、
+`internal/auth` 的 DPAPI 加密落盘、`internal/platform` 单实例锁。
+
+**刻意的分歧**
+
+- `provider.Oczen`：代码与常量保留（跟随上游，便于后续继续合并），但**不登记 Runtime**
+  —— 模型列表、路由、费率面板都不出现该渠道。本仓不再使用 Oczen 匿名通道。
+- `cmd/workbuddy-api/proxy.go`（本地每渠道代理）已被上游 backuplink 取代，删除。
+
 > 再次说明：**本项目不产出、不包含、不分发任何协议逆向研究成果。**
 > 三者都是集成与聚合，各渠道的接口参数、签名算法、风控指纹等底层知识全部来自
 > 下表各上游项目的公开成果；所有逆向相关的功劳与风险归于下述各项目作者。

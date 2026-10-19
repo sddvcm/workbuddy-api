@@ -47,6 +47,13 @@ docs/*
 !docs/三接口兼容改造备忘.md
 !docs/用量积分流水记账备忘.md
 !docs/任务体系协议.md
+!docs/GitHub直连下载与加速代理调研备忘.md
+!docs/决议项.md
+!docs/渠道接入备忘.md
+!docs/接口参考.md
+!docs/模型降级链定义.md
+!docs/全渠道登录授权方式梳理.md
+!docs/渠道配色规范.md
 
 # 临时文件
 temp/
@@ -63,3 +70,6 @@ Thumbs.db
 github_token.txt
 HANDOFF.md
 GO多平台发布备忘.md
+
+# 本仓库内部工具脚本（上游同步辅助，不入库）
+.workbuddy/

@@ -62,25 +62,12 @@ func NewWithTimeout(timeout time.Duration) *Client {
 	}
 }
 
-// NewWithBase 测试用：覆盖 base/gateway。
-func NewWithBase(base, gateway string) *Client {
-	c := New()
-	c.Base = base
-	c.Gateway = gateway
-	return c
-}
-
-// setModelMap 记录动态模型映射（客户端名 → key）。
-func (c *Client) setModelMap(m map[string]string) {
-	c.modelMu.Lock()
-	c.modelMap = m
-	c.modelMu.Unlock()
-}
-
 // setModelEntries 记录 上游 key → 模型条目 表（与 setModelMap 同批写入）。
-func (c *Client) setModelEntries(entries map[string]DynamicModel) {
+// setModelEntries 同批写入 上游 key→条目表 与 客户端名→key 映射（一把锁，防中间态）。
+func (c *Client) setModelEntries(entries map[string]DynamicModel, nameToKey map[string]string) {
 	c.modelMu.Lock()
 	c.entries = entries
+	c.modelMap = nameToKey
 	c.modelMu.Unlock()
 }
 
@@ -124,17 +111,6 @@ func (c *Client) get(path, dt string) (*http.Response, error) {
 	return c.HTTP.Do(req)
 }
 
-func (c *Client) post(path, dt string, body []byte) (*http.Response, error) {
-	if body == nil {
-		body = []byte("{}")
-	}
-	req, err := http.NewRequest(http.MethodPost, c.base()+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	billingHeaders(req, dt)
-	return c.HTTP.Do(req)
-}
 
 func readBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()

@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"workbuddy-api/internal/loopguard"
 )
 
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
@@ -19,10 +22,33 @@ import (
 // 客户端已走，日志口径不同。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
 var errEmptyStream = errors.New("upstream stream contained no valid data events")
 
-// IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
-// 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
-// upstream_parse 同语义），与客户端断连类错误区分。
-func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
+// sseDataPayload 判断一行 SSE 是否数据帧，并返回载荷。
+//
+// ⚠️ 规矩：**入站** SSE 帧的 `data:` 之后可能有空格、也可能没有 —— 两种都必须认。
+// WHATWG SSE 规范只要求 `data:` 前缀，冒号后的空格是**可选**的，而实际上游两种都在用：
+//   - `data: {...}`（大多数渠道）
+//   - `data:{...}`（LobsterAI 实测如此）
+//
+// 2026-10-18 的事故（LobsterAI 6 账号 6/6 全坏）：本文件原先写成
+// `strings.HasPrefix(line, "data: ")` + `TrimPrefix(line, "data: ")`，只认带空格的形态。
+// 无空格帧于是掉进「其他行」分支原样透传但**不计入有效帧** ⇒ 触发「空流」兜底，
+// 给每个正常回答额外追加一帧 `{"error":{"message":"empty upstream stream"...}}`
+// 并返回 errEmptyStream；Aggregate（非流式）更彻底 —— 一帧都认不出，直接 502。
+// 而 errEmptyStream 会被上层当作「账号连续错误」⇒ **健康账号被冷却**，
+// 于是「6 个账号全坏」。
+//
+// 因此本函数是**入站帧解析的唯一入口**：新增解析点请一律调它，不要自己写 HasPrefix，
+// 否则这个 bug 会以同样的形态再来一次（本仓同类清单/判据散落问题已复发多次）。
+//
+// 返回值 ok=false 表示该行不是数据帧（注释、event:、id:、空行等）。
+func sseDataPayload(line string) (payload string, ok bool) {
+	const prefix = "data:"
+	if !strings.HasPrefix(line, prefix) {
+		return "", false
+	}
+	// 只剥前缀，不乱切：`data:  {}`（多空格）与 `data:{}` 都交给调用方 TrimSpace。
+	return strings.TrimSpace(strings.TrimPrefix(line, prefix)), true
+}
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
@@ -122,7 +148,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		}
 	}
 	// mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
-	// 非流式拼接，content 只取一次）。role/reasoning_content/tool_calls 与 delta 分支
+	// 非流式拼接，content 只取一次）。role/reasoning/tool_calls 与 delta 分支
 	// 同构透出；content 同样置 gotAnyContent，与 delta 路径的 latch 语义一致
 	// （一帧整条 message 之后，后续 delta 帧不重复追加）。
 	mergeMessageFields := func(msg map[string]any) {
@@ -132,7 +158,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		if txt, ok := msg["content"].(string); ok {
 			appendContent(txt)
 		}
-		if rc, ok := msg["reasoning_content"].(string); ok {
+		if rc := reasoningDeltaOf(msg); rc != "" {
 			reasoning.WriteString(rc)
 		}
 		if tcs, ok := msg["tool_calls"].([]any); ok {
@@ -145,8 +171,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if strings.HasPrefix(line, "data: ") {
-			payload := strings.TrimPrefix(line, "data: ")
+		if payload, isData := sseDataPayload(line); isData {
 			if payload == "[DONE]" {
 				// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 				sawDone = true
@@ -184,7 +209,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								if txt, ok := delta["content"].(string); ok {
 									appendContent(txt)
 								}
-								if rc, ok := delta["reasoning_content"].(string); ok {
+								if rc := reasoningDeltaOf(delta); rc != "" {
 									reasoning.WriteString(rc)
 								}
 								if tcs, ok := delta["tool_calls"].([]any); ok {
@@ -192,7 +217,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 								}
 							}
 							// 有的上游把完整消息放在 message 里（非 delta）：
-							// 整条并入（role/content/reasoning_content/tool_calls），
+							// 整条并入（role/content/reasoning/tool_calls），
 							// 与 delta 分支同构。delta 已取过正文（gotAnyContent）则跳过
 							// （避免与 delta 路径重复拼接——PR #134 的 latch 语义）。
 							if msg, ok := c["message"].(map[string]any); ok && !gotAnyContent {
@@ -384,10 +409,70 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 	}
 }
 
+// reasoningDeltaOf 从 OpenAI 形状的 delta 里提取思考增量，归一化到
+// `reasoning_content` 单字段下发。
+//
+// 上游对思考增量有三种字段名，实测并存：
+//   - `reasoning_content`：DeepSeek 系 / WorkBuddy 系（本仓库历史唯一形态）；
+//   - `reasoning`：OpenRouter 归一化字段（Cline 免费池、OpenZen 等走 OpenRouter
+//     的渠道实测下发；`@ai-sdk/openai-compatible` 的读取式是
+//     `delta.reasoning_content ?? delta.reasoning`，即下游本就兼容两者）；
+//   - `reasoning_details`：OpenRouter 结构化块数组，`reasoning.summary` 条目
+//     的 `summary` 文本与同帧 `reasoning` 逐字相同（2026-10-13 实抓比对：
+//     拼接后长度 179 == 179 且全等），`reasoning.encrypted` 条目是回放用密文、
+//     无可读文本。
+//
+// 归一化方向选 `reasoning_content` 而非 `reasoning`：前者是本仓库九渠道
+// 白名单、loopguard 判据、gateway 的 Anthropic 转换共同认定的唯一字段，
+// 改成后者要动四处；且 AI SDK 优先读前者。
+//
+// 三者的优先级：`reasoning_content` > `reasoning` > `reasoning_details`。
+// 同一帧通常只出现一种（实测 `reasoning` 与 `reasoning_details.summary` 并存时
+// 内容相同，取前者避免重复拼接）。`reasoning_details` 内部再分两级：
+// `reasoning.text`（原始全文）优先于 `reasoning.summary`（高层摘要），
+// 两者都取则同一段推理会以两种粒度重复下发。
+func reasoningDeltaOf(d map[string]any) string {
+	if v, ok := d["reasoning_content"].(string); ok && v != "" {
+		return v
+	}
+	if v, ok := d["reasoning"].(string); ok && v != "" {
+		return v
+	}
+	items, ok := d["reasoning_details"].([]any)
+	if !ok {
+		return ""
+	}
+	var full, summary strings.Builder
+	for _, it := range items {
+		m, _ := it.(map[string]any)
+		if m == nil {
+			continue
+		}
+		switch m["type"] {
+		case "reasoning.text": // 原始全文（anthropic-claude-v1 等格式）
+			if s, ok := m["text"].(string); ok {
+				full.WriteString(s)
+			}
+		case "reasoning.summary": // 高层摘要（meta-responses-v1 等格式）
+			if s, ok := m["summary"].(string); ok {
+				summary.WriteString(s)
+			}
+			// 其余类型（encrypted 为密文、无可读文本）不取
+		}
+	}
+	if full.Len() > 0 {
+		return full.String()
+	}
+	return summary.String()
+}
+
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
 // usage 缺失 → null，保证任意标准客户端按规范解析。
+//
+// 思考增量经 reasoningDeltaOf 归一化到 `reasoning_content` 单字段
+// （OpenRouter 的 `reasoning`/`reasoning_details` 上游字段名不直接透出）。
 func normalizeFrame(obj map[string]any) map[string]any {
 	out := map[string]any{}
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
@@ -420,7 +505,7 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				if v, ok := d["content"].(string); ok && v != "" {
 					delta["content"] = v
 				}
-				if v, ok := d["reasoning_content"].(string); ok && v != "" {
+				if v := reasoningDeltaOf(d); v != "" {
 					delta["reasoning_content"] = v
 				}
 				if v, ok := d["refusal"].(string); ok && v != "" {
@@ -462,17 +547,6 @@ func normalizeFrame(obj map[string]any) map[string]any {
 	return out
 }
 
-// Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-// 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
-//
-// StreamHint 变体（gateway_hint 任务）：上游 error 帧透传时附加
-// error.gateway_hint 字段——message 原文不动，hint 并列补充；hintFn 返回空串
-// 或 nil 时与 Stream 行为逐字节一致。
-func Stream(w http.ResponseWriter, r io.Reader) error {
-	return StreamCapture(w, r, nil)
-}
-
 // StreamCapture 同 Stream，额外把末帧捕获的 usage（OpenAI 形状）回调给 onUsage
 // （非 nil 时；上游未返回 usage 则不回调）。供 handler 记 token 流水。
 // usage 帧同时仍透传给客户端，客户端行为零变化。
@@ -480,14 +554,14 @@ func StreamCapture(w http.ResponseWriter, r io.Reader, onUsage func(map[string]a
 	return streamCore(w, r, nil, onUsage)
 }
 
-// streamCore 流式透传核心：hintFn 注入 gateway_hint，onUsage 捕获末帧 usage。
-//
-// StreamHint 同 Stream，但上游 error 帧透出前把 hintFn(payload) 的返回值写入
-// error.gateway_hint。hintFn 为 nil 或返回空串 → 原样透传（零改写）。
-// 空流兜底 error 帧（"empty upstream stream"）不带 hint（网关本地故障形态
-// 未覆盖，不编造）。
-func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) error {
-	return streamCore(w, r, hintFn, nil)
+// StreamWith 同时需要两个钩子时的最小导出（既捕获上游 error 帧、又记末帧 usage）。
+// Stream / StreamCapture / StreamHint 各自只带一个钩子，而 cline 渠道两者都必需：
+// 它的失败形态是「HTTP 200 + 流内 error 帧 + 上游自己发 [DONE]」（R40 家族），
+// 不捕获 error 帧就会把失败伪装成空回答；不捕获 usage 就没法记 token 流水。
+// 仅转发 streamCore，无任何额外分支，与上述三个导出的行为完全一致。
+func StreamWith(w http.ResponseWriter, r io.Reader, hintFn func(string) string,
+	onUsage func(map[string]any)) error {
+	return streamCore(w, r, hintFn, onUsage)
 }
 
 func streamCore(w http.ResponseWriter, r io.Reader, hintFn func(string) string, onUsage func(map[string]any)) error {
@@ -497,6 +571,15 @@ func streamCore(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+
+	// 思考链死循环守卫（发癫检测）：仅在全局启用时创建（每个流一个实例，用完即弃）。
+	// 命中时发一帧 OpenAI 规范 error（code=upstream_reasoning_loop）并中断，不补 [DONE]，
+	// 错误返回给 handler —— handler 不对它做账号惩罚（未实现 StreamErrorClassifier），
+	// 由下游 agent 自行重试（R16/R38 同族：模型级问题不罚账号）。
+	var guard *loopguard.Guard
+	if loopguard.Enabled() {
+		guard = loopguard.NewDefault()
+	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -531,6 +614,17 @@ func streamCore(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		var obj map[string]any
 		valid := 0
 		if json.Unmarshal([]byte(payload), &obj) == nil {
+			// 思考链死循环守卫：喂入 reasoning_content 增量，命中即中断。
+			// 位置刻意放在「上游 error 帧透传」之前：error 帧没有 reasoning，
+			// 顺序无实际影响，但守卫只关心 delta.reasoning_content，放这里语义最清晰。
+			if guard != nil {
+				if rc := loopguard.ReasoningDeltaOf(obj); rc != "" {
+					if hit := guard.Push(rc); hit != nil {
+						werr := writeLoopError(w, fl, hit)
+						return 0, werr
+					}
+				}
+			}
 			// usage 捕获：非空 usage 对象回调给记账方（末帧覆盖前面，OpenAI 语义末帧才是全量）
 			if onUsage != nil {
 				if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
@@ -589,13 +683,18 @@ readLoop:
 	for {
 		line, err := br.ReadString('\n')
 		trimmed := strings.TrimRight(line, "\r\n")
+		// 用 sseDataPayload 统一认帧：`data: {...}` 与 `data:{...}` 都算数据帧
+		//（2026-10-18 LobsterAI 全坏事故：原先只认带空格的形态，无空格帧被当成
+		//  「其他行」原样透传却不计有效帧 ⇒ 每个正常回答都被追加一帧
+		//  empty upstream stream 并返回 errEmptyStream）。
+		payload, isData := sseDataPayload(trimmed)
 		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
+		case isData && payload == "[DONE]":
 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 			// [DONE] 统一在循环结束后写出，保证恰好一个。
 			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+		case isData:
+			n, werr := writeFrame(payload)
 			// EOF 处未以换行收尾且该帧不是合法 JSON → 这行本身是半个帧（被砍断），
 			// 已按原样写出的是残缺数据，必须按截断处理（不补 DONE）。
 			if err == io.EOF && n == 0 && strings.TrimSpace(line) != "" {
@@ -670,6 +769,23 @@ func jsonString(s string) string {
 		return `"upstream error"`
 	}
 	return string(b)
+}
+
+// writeLoopError 写一帧 OpenAI 规范 error（code=upstream_reasoning_loop）并 flush，
+// 然后返回 *loopguard.Error 供调用方直接上抛（handler 据其未实现 StreamErrorClassifier
+// 而跳过账号惩罚）。
+// ⚠️ 刻意不补 [DONE]：守卫命中是失败中断，不是正常收尾（R36）。
+// 写失败（客户端已断开）时仍返回守卫错误——调用方需要它区分「守卫命中」与「写失败」。
+func writeLoopError(w http.ResponseWriter, fl http.Flusher, hit *loopguard.Hit) error {
+	gerr := &loopguard.Error{Hit: *hit}
+	if _, werr := io.WriteString(w, "data: "+loopguard.ErrorFrameJSON(hit)+"\n\n"); werr != nil {
+		log.Printf("reasoning loop error frame write failed: %v", werr)
+		return gerr
+	}
+	if fl != nil {
+		fl.Flush()
+	}
+	return gerr
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

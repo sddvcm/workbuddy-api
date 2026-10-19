@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -271,6 +272,77 @@ func TestBuildFeesChannels(t *testing.T) {
 }
 
 // TestBuildFeesChannelsNoPricing 无费率数据时全部为 unknown，不应丢失模型。
+// TestFeeChannelOrderCoversAllKinds：费率面板的渠道清单必须覆盖**全部已实现渠道**。
+//
+// 为什么必须锁（2026-10-12 实测踩坑）：buildFeesChannels 只遍历 feeChannelOrder，
+// 没在表里的渠道**永远不会出现在面板**，而 /v1/models 与 CachedChannelModels 都有它
+// ⇒ 表现为「接口能调、模型列表里有、但费率面板没这个 tab」。cline 渠道接入时漏登此表，
+// 症状持续到手动排查才发现（与 R34「声明了没接线」同族：不报错、不崩溃、纯静默）。
+// 本测试直接以 provider.Kind 常量全集为准，新增渠道若不登记就会失败。
+//
+// 例外：旧 Qoder（QoderWork）已从界面下线（路由保留供存量账号用），故显式豁免。
+// 例外：Oczen 在本仓已停用（代码与常量保留以便跟上游合并，但不登记 Runtime、
+// 不暴露模型、不参与路由），因此费率面板也不该出现它的 tab。
+func TestFeeChannelOrderCoversAllKinds(t *testing.T) {
+	all := []provider.Kind{
+		provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.TraeCode,
+		provider.QoderCN, provider.QoderCOM, provider.QwenWork, provider.GLM,
+		provider.MonkeyCode, provider.Raccoon, provider.Loomy, provider.Oczen, provider.Cline,
+		provider.Qoder, // 已下线，仅存量路由保留
+	}
+	inOrder := map[provider.Kind]bool{}
+	for _, k := range feeChannelOrder {
+		inOrder[k] = true
+	}
+	for _, k := range all {
+		if k == provider.Qoder || k == provider.Oczen {
+			continue // 旧 Qoder 已下线、Oczen 本仓停用，均不应出现在面板
+		}
+		if !inOrder[k] {
+			t.Errorf("渠道 %s 未登记进 feeChannelOrder ⇒ 费率面板不会出现该渠道 tab", k)
+		}
+	}
+	if inOrder[provider.Qoder] {
+		t.Error("旧 Qoder 已从界面下线，不应再登记进 feeChannelOrder")
+	}
+	if inOrder[provider.Oczen] {
+		t.Error("Oczen 在本仓已停用，不应再登记进 feeChannelOrder")
+	}
+}
+
+// TestBuildFeesChannelsHandMeasured：本工具**手工实测**的上下文也要能在面板展示
+// （has_context=true），但必须同时带 hand_measured 标记让前端如实标注来源。
+//
+// 为什么单独一条：cline 这类渠道上游根本不返回上下文，若不把实测值放行，
+// 面板永远只显示「未知」（用户看不到实测的 1M）；但若直接置 ContextFromAPI=true
+// 就是把实测冒充成上游官方值（违反 R46/issue #40 的「不把缺失当结论」原则）。
+func TestBuildFeesChannelsHandMeasured(t *testing.T) {
+	models := map[provider.Kind][]provider.ModelInfo{
+		provider.Cline: {
+			{ID: "cline-free/step-5-preview", ContextWindow: 1_000_000, HandMeasured: true},
+			{ID: "cline-free/unknown-new", ContextWindow: 0}, // 无实测数据
+		},
+	}
+	got := buildFeesChannels(models, nil, []provider.Kind{provider.Cline})
+	if len(got) != 1 {
+		t.Fatalf("want 1 channel, got %d", len(got))
+	}
+	byID := map[string]feesModelRow{}
+	for _, r := range got[0].Models {
+		byID[r.Model] = r
+	}
+	step := byID["cline-free/step-5-preview"]
+	if !step.HasContext || step.ContextWindow != 1_000_000 {
+		t.Errorf("实测上下文应可展示（has_context=true, ctx=1M）：%+v", step)
+	}
+	if !step.HandMeasured {
+		t.Error("实测值必须带 hand_measured 标记，否则前端无从区分、会把它当上游官方值")
+	}
+	if newm := byID["cline-free/unknown-new"]; newm.HasContext || newm.HandMeasured {
+		t.Errorf("无实测数据的模型不得展示上下文：%+v", newm)
+	}
+}
+
 func TestBuildFeesChannelsNoPricing(t *testing.T) {
 	models := map[provider.Kind][]provider.ModelInfo{
 		provider.TraeWork: {{ID: "glm-5.2"}, {ID: "kimi-k2.7"}},
@@ -404,7 +476,7 @@ func TestResourceDetailSelfHealsSessionDead(t *testing.T) {
 		au.RefreshToken = "rt"
 	}
 
-	remain, items, err := a.ResourceDetail("uid-tip")
+	remain, items, _, _, err := a.ResourceDetail("uid-tip")
 	if err != nil {
 		t.Fatalf("ResourceDetail 应自愈，却报错: %v", err)
 	}
@@ -423,10 +495,118 @@ func TestResourceDetailNoRefreshTokenStillErrors(t *testing.T) {
 		au.RefreshToken = ""
 	}
 
-	if _, _, err := a.ResourceDetail("uid-nort"); err == nil {
+	if _, _, _, _, err := a.ResourceDetail("uid-nort"); err == nil {
 		t.Error("无 refresh token 时应报错，而不是静默返回空")
 	}
 	if up.refreshCalls.Load() != 0 {
 		t.Error("无 refresh token 时不应尝试刷新")
+	}
+}
+
+// TestResourceDetailWritesBackPoolSnapshot 同源修复的守门：ResourceDetail 成功后
+// pool 快照必须更新为同一响应的值。否则卡片顶层停留在上次刷新事件的旧值，
+// 面板出现「同屏两个数字对不上」（实测为时差，非上游口径问题）。
+func TestResourceDetailWritesBackPoolSnapshot(t *testing.T) {
+	up := &fakeUpstream{remain: 1234}
+	a, p := newTestApp(t, provider.TraeWork, up, "uid-rd")
+
+	// 先置旧快照，模拟「上次刷新事件之后又发生了消耗」。
+	p.SetCreditDetail("uid-rd", 9999, 0, 0)
+
+	remain, items, expiring, unusable, err := a.ResourceDetail("uid-rd")
+	if err != nil {
+		t.Fatalf("ResourceDetail: %v", err)
+	}
+	if remain != 1234 || len(items) != 1 {
+		t.Fatalf("remain=%d items=%d, want 1234/1", remain, len(items))
+	}
+	if expiring != 0 || unusable != 0 {
+		t.Fatalf("expiring=%d unusable=%d, want 0/0", expiring, unusable)
+	}
+	if st, ok := p.Status("uid-rd"); !ok || st.Credits != 1234 {
+		t.Fatalf("pool 快照未回写: ok=%v credits=%d, want 1234", ok, st.Credits)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 自定义渠道（R66）与积分体系的关系：无积分概念，不得产生假失败/假 0
+// ---------------------------------------------------------------------------
+
+// TestRefreshAllSkipsCustomChannels RefreshAll 必须跳过自定义渠道：
+// 其占位账号无 access/refresh token（凭据本体是渠道级 api_key），纳入统计只会
+// 每渠道产生一条「no token」假失败，面板 toast 报「失败 N」纯噪音（issue 用户实测：
+// 4 个自定义渠道每次刷新都「失败 4」，但 32 个真实账号全部成功）。
+// 对齐 oczen 的跳过逻辑（无积分概念的渠道都不参与）。
+func TestRefreshAllSkipsCustomChannels(t *testing.T) {
+	up := &fakeUpstream{remain: 500}
+	a, _ := newTestApp(t, provider.WorkBuddyAI, up, "uid-real")
+
+	// 挂一个自定义渠道运行时：占位账号故意不带任何 token（与 main.buildCustomRuntimes 一致）
+	cp := pool.New(t.TempDir() + "/state-mychannel.json")
+	cp.Add(&auth.Auth{Kind: "mychannel", UID: "custom-mychannel", Nickname: "mychannel (自定义)", ExpiresAt: 4102444800})
+	a.UpdateCustomRuntimes(map[provider.Kind]*Runtime{
+		provider.Kind("mychannel"): {Kind: provider.Kind("mychannel"), Pool: cp, Upstream: up, Custom: true},
+	})
+
+	sum := a.RefreshAll()
+	if sum.Failed != 0 {
+		t.Errorf("自定义渠道不应计入失败：failed=%d（accounts=%v）", sum.Failed, sum.Platforms["mychannel"])
+	}
+	if sum.OK != 1 {
+		t.Errorf("真实账号应正常计入成功：ok=%d", sum.OK)
+	}
+	if _, ok := sum.Platforms["mychannel"]; ok {
+		t.Errorf("自定义渠道不应出现在汇总里")
+	}
+}
+
+// TestRefreshAllSkipsDisabledCustomChannels 变体：自定义渠道停用态（Enabled=false 时
+// buildCustomRuntimes 直接不装配，但热更新窗口内可能出现 Custom+Disabled 组合），同样不崩不进统计。
+func TestRefreshCreditsCustomChannelNA(t *testing.T) {
+	up := &fakeUpstream{remain: 500}
+	a, _ := newTestApp(t, provider.WorkBuddyAI, up, "uid-real")
+
+	cp := pool.New(t.TempDir() + "/state-mychannel.json")
+	cp.Add(&auth.Auth{Kind: "mychannel", UID: "custom-mychannel", ExpiresAt: 4102444800})
+	a.UpdateCustomRuntimes(map[provider.Kind]*Runtime{
+		provider.Kind("mychannel"): {Kind: provider.Kind("mychannel"), Pool: cp, Upstream: up, Custom: true},
+	})
+
+	// 单账号刷新必须明确报「不适用」，而不是假装成功把池内余额写成 0。
+	remain, err := a.RefreshCredits("custom-mychannel")
+	if err == nil {
+		t.Fatalf("自定义渠道单账号刷新应报「不适用」，却成功返回 remain=%d", remain)
+	}
+	if !strings.Contains(err.Error(), "不适用") {
+		t.Errorf("错误信息应说明无积分概念，得: %v", err)
+	}
+	if st, ok := cp.Status("custom-mychannel"); ok && st.Credits != 0 {
+		// 未被 creditSnapshot 污染（这里快照本就是 0，重点是没有假装成功）
+		t.Logf("pool credits=%d", st.Credits)
+	}
+
+	// 积分明细同理：报错而不是返回空 items 让前端弹空白层。
+	if _, _, _, _, err := a.ResourceDetail("custom-mychannel"); err == nil {
+		t.Error("自定义渠道积分明细应报「不适用」，却成功返回")
+	}
+}
+
+// TestCreditsNAKindCoversCustomChannels creditsNAKind 对自定义渠道返回 true
+// （/api/state 据此给 credits_na=true，前端显示「不适用」）。
+func TestCreditsNAKindCoversCustomChannels(t *testing.T) {
+	up := &fakeUpstream{remain: 1}
+	a, _ := newTestApp(t, provider.WorkBuddyAI, up, "uid-real")
+
+	cp := pool.New(t.TempDir() + "/state-mychannel.json")
+	cp.Add(&auth.Auth{Kind: "mychannel", UID: "custom-mychannel", ExpiresAt: 4102444800})
+	a.UpdateCustomRuntimes(map[provider.Kind]*Runtime{
+		provider.Kind("mychannel"): {Kind: provider.Kind("mychannel"), Pool: cp, Upstream: up, Custom: true},
+	})
+
+	if !a.creditsNAKind("mychannel") {
+		t.Error("自定义渠道应判定为积分不适用（credits_na=true）")
+	}
+	if a.creditsNAKind("workbuddyai") {
+		t.Error("内建有积分渠道不应被判定为 NA")
 	}
 }

@@ -71,21 +71,6 @@ func NewWithTimeout(timeout time.Duration) *Client {
 	}
 }
 
-// NewWithBase 测试用：覆盖 base/gateway。
-func NewWithBase(base, gateway string) *Client {
-	c := New()
-	c.Base = base
-	c.Gateway = gateway
-	return c
-}
-
-// setModelMap 记录动态模型映射（客户端名 → key）。
-func (c *Client) setModelMap(m map[string]string) {
-	c.modelMu.Lock()
-	c.modelMap = m
-	c.modelMu.Unlock()
-}
-
 // modelKey 客户端模型名 → 上游 model key：动态映射优先；
 // 无静态兜底表，未命中时原样返回（上游对未知 key 走兜底，不计 quota —— qoder2api 注释）。
 func (c *Client) modelKey(clientName string) string {
@@ -173,17 +158,6 @@ func (c *Client) get(path, dt string) (*http.Response, error) {
 	return c.HTTP.Do(req)
 }
 
-func (c *Client) post(path, dt string, body []byte) (*http.Response, error) {
-	if body == nil {
-		body = []byte("{}")
-	}
-	req, err := http.NewRequest(http.MethodPost, c.Base+path, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	billingHeaders(req, dt)
-	return c.HTTP.Do(req)
-}
 
 func readBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()

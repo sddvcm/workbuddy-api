@@ -56,8 +56,3 @@ func StaticModels() []provider.ModelInfo {
 	}
 	return out
 }
-
-// ModelKey 返回客户端模型名对应的上游 model key；未知模型返回空。
-func ModelKey(clientName string) string {
-	return staticModelKeys[clientName]
-}

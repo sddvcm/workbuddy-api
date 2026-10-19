@@ -139,9 +139,9 @@ func TestModelPersistence(t *testing.T) {
 	}
 	// 用真实「今日」驱动（day 守卫以 New 时的本地日为基准，固定日期会被判跨天残留）
 	day1 := time.Now()
-	s.AddUsage("workbuddy/m1", 30, 20, 0.5, 600, 2, day1)
-	s.AddUsage("workbuddy/m1", 10, 5, 0.25, 400, 1, day1)
-	s.AddUsage("traework/m2", 100, 50, 0, 900, 5, day1)
+	s.AddUsage("workbuddy/m1", 30, 20, 0.5, 600, 2, 0, false, day1)
+	s.AddUsage("workbuddy/m1", 10, 5, 0.25, 400, 1, 0, false, day1)
+	s.AddUsage("traework/m2", 100, 50, 0, 900, 5, 0, false, day1)
 	s.FlushNow()
 
 	// 重启：今日模型 + 今日全局计数（tokens/reqs/exact）恢复
