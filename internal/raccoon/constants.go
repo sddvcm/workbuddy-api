@@ -4,8 +4,8 @@
 //   - 推理走官方托管网关：POST https://xiaohuanxiong.com/api/web/llm/v2/chat/completions
 //     鉴权只认 `Authorization: Bearer <access_token>`（token 头 / Cookie / X-Access-Token 均 401）。
 //   - 模型目录：GET /api/web/llm/v2/model_catalog（含 billing_multiplier 倍率 → 费率面板数据源）。
-//   - 凭据：access_token（JWT，实测 ≈2h）+ refresh_token（JWT，实测 ≈30 天），
-//     刷新端点为 POST https://xiaohuanxiong.com/api/electron/auth/v1/refresh，
+//   - 凭据：access_token（JWT，实测 ≈1h）+ refresh_token（JWT，实测 ≈30 天），
+//     刷新端点为 POST https://xiaohuanxiong.com/api/web/auth/v1/refresh，
 //     body {"refresh_token":…} → resp {data:{access_token,refresh_token}}；**refresh_token 会轮换**。
 //   - 错误信封是 LiteLLM 风格：401 + {"code":200001|200003}；400 + {"error":{"message":"litellm…"}}。
 //   - ⚠️ 未知模型名会被上游**静默回落到默认模型**并返回 200 —— 渠道层必须自行校验模型名，
@@ -33,12 +33,21 @@ const (
 	// 另需合法 `type`；暂无必要，保留备查）。
 	EpPointsBills = "/api/web/points/v1/bills"
 
-	// EpAuthRefresh 桌面端刷新端点（客户端 env: NEXT_PUBLIC_AUTH_API_PREFIX = /api/electron/auth/v1）。
+	// EpOfficeSettingInfo 工作台设置（配额/空间/功能开关），也是**每日积分落账的触发点**。
+	//
+	// 2026-10-15 实测：每日 300 积分名义上 00:00 记账（bills 的 grant_at），
+	// 实际要等账号当天第一次访问「工作台业务接口」才落账（created_at = 该次访问时刻）。
+	// 三账号对照：调本接口 → 各入账 300（point_grant_popups 非空）；
+	// 纯对话 / 只读余额 / auth/v1 的 user_info 与 iam/confirm → 均不入账。
+	// 网页端打开工作台首页时自己就会调它，故调它 ≈ 打开一次网页（见 checkin.go）。
+	EpOfficeSettingInfo = "/api/web/office/v3/setting_info"
+
+	// EpAuthRefresh 桌面端旧前缀（客户端 env: NEXT_PUBLIC_AUTH_API_PREFIX = /api/electron/auth/v1）。
+	// 2026-10-10 实测该前缀的 /refresh 已 **404**（上游下线），仅作历史兑底保留。
 	EpAuthRefresh = "/api/electron/auth/v1/refresh"
-	// EpAuthRefreshWeb 客户端**优先**使用的远端前缀（env: NEXT_PUBLIC_DESKTOP_REMOTE_AUTH_API_PREFIX
-	// = /api/web/auth/v1）。客户端的 getAuthApiUrl() 优先选它，仅当其为空才回落 electron 前缀。
-	// 两个前缀实测都可用，故这里维持「先 electron、404 回落 web」不影响功能；
-	// 若要改成「先 web」（更贴合上游现状），需先实测 web 前缀的 /refresh 确能轮换 token。
+	// EpAuthRefreshWeb 现行刷新前缀（客户端 env: NEXT_PUBLIC_DESKTOP_REMOTE_AUTH_API_PREFIX
+	// = /api/web/auth/v1）。**2026-10-10 实测唯一可用**：网页版与桌面版凭据都用它刷新，
+	// 故 RefreshToken 以它为**首选**，404 才回落 electron 旧前缀。
 	EpAuthRefreshWeb = "/api/web/auth/v1/refresh"
 )
 

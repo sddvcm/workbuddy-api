@@ -1,0 +1,8 @@
+blank_issues_allowed: false
+contact_links:
+  - name: 使用疑问 / 经验交流
+    url: https://github.com/sddvcm/workbuddy-api/discussions
+    about: 不确定是不是 bug、想问问怎么用，走讨论区，不要占 issue
+  - name: 参与贡献指南
+    url: https://github.com/sddvcm/workbuddy-api/blob/main/CONTRIBUTING.md
+    about: 提 PR 前必读：本地验证三道关、代码约定、上游同步注意事项

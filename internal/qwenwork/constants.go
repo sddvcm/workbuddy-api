@@ -12,8 +12,6 @@
 package qwenwork
 
 import (
-	"sort"
-
 	"workbuddy-api/internal/provider"
 )
 
@@ -25,15 +23,12 @@ const (
 	WebBase = "https://qwenwork.cn"
 
 	EpChat      = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common"
-	EpChatPath  = "/algo/api/v2/service/pro/sse/agent_chat_generation" // 签名用 path（去 query）
-	EpModels    = "/api/v2/model/list"                                 // COSY GET
-	EpDTRefresh = "/api/v1/deviceToken/refresh"                        // COSY 域的 token 刷新（body {refresh_token,target:"c"}）
-	EpBalance   = "/user/balance"                                      // Bearer GET
-	EpUserInfo  = "/user/info"                                         // Bearer GET（账号昵称兑底）
-	EpWallets   = "/user/wallets"                                      // Bearer GET
-	EpBillings  = "/user/billings?source=all"                          // Bearer GET
-	EpChatModes = "/api/chat-modes"                                    // Bearer GET（费率表）
-	EpAcctCtx   = "/user/v2/account-context?include=user,plan,quota"   // Bearer GET
+	EpModels    = "/api/v2/model/list"          // COSY GET
+	EpDTRefresh = "/api/v1/deviceToken/refresh" // COSY 域的 token 刷新（body {refresh_token,target:"c"}）
+	EpBalance   = "/user/balance"               // Bearer GET
+	EpUserInfo  = "/user/info"                  // Bearer GET（账号昵称兑底）
+	EpWallets   = "/user/wallets"               // Bearer GET
+	EpChatModes = "/api/chat-modes"             // Bearer GET（费率表）
 )
 
 // ChannelName 费率面板中的渠道标识。
@@ -95,11 +90,4 @@ func priceFactorOf(key string) float64 {
 		return 1.8
 	}
 	return 0
-}
-
-// sortStrings 排序副本（避免只为展示顺序引入额外状态）。
-func sortStrings(ss []string) []string {
-	out := append([]string{}, ss...)
-	sort.Strings(out)
-	return out
 }

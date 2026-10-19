@@ -32,7 +32,7 @@ type Client struct {
 	// 客户端表现为「突然无响应」。空闲兜底改由 IdleReader 承担。
 	StreamHTTP *http.Client
 	// IdleTimeout 流式空闲超时：连续该时长读不到任何字节即判上游卡死。
-	// 0 = 用 DefaultIdleTimeout。由 main 装配时注入 config.upstream.stream_idle_seconds。
+	// 0 = 用 DefaultIdleTimeout。⚠️ 目前**没有配置项**（main 不注入），实际恒为默认值。
 	IdleTimeout time.Duration
 
 	// liveMu 保护 liveIDs（动态目录缓存）——与 raccoon 同款缺陷的修复：
@@ -116,7 +116,18 @@ func (c *Client) idleTimeout() time.Duration {
 	return c.IdleTimeout
 }
 
-func session(a *auth.Auth) string { return strings.TrimSpace(a.AccessTokenValue()) }
+// sessionOf 读取凭据里的 session（nil 安全）。
+//
+// nil Auth 必须安全：签到/余额这类路径可能在「账号刚被移除」时被调度器调用，
+// 旧写法 `a.AccessTokenValue()` 会直接空指针 panic（2026-10-17 由 checkin 测试抓到）。
+func sessionOf(a *auth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	return strings.TrimSpace(a.AccessTokenValue())
+}
+
+func session(a *auth.Auth) string { return sessionOf(a) }
 
 // traceparent 生成 W3C traceparent；官方源码注释实测：**缺这个头 chat/completions 会挂死到超时**。
 func traceparent() string {
@@ -321,28 +332,24 @@ func unknownModelBody(m string) string {
 // 模型与费率
 // ---------------------------------------------------------------------------
 
-type modelsResp struct {
-	ReasoningEnabled        bool         `json:"reasoning_enabled"`
-	ReasoningCatalogVersion string       `json:"reasoning_catalog_version"`
-	Data                    []loomyModel `json:"data"`
-}
-
 type loomyModel struct {
 	ID                     string   `json:"id"`
 	Name                   string   `json:"name"`
-	Protocol               string   `json:"protocol"`
 	ContextLength          int64    `json:"context_length"`
 	MaxOutputTokens        int64    `json:"max_output_tokens"`
 	ReasoningEfforts       []string `json:"reasoning_efforts"`
 	DefaultReasoningEffort string   `json:"default_reasoning_effort"`
-	IsDefaultModel         bool     `json:"is_default_model"`
 	Capabilities           struct {
 		Reasoning       bool     `json:"reasoning"`
 		Vision          bool     `json:"vision"`
 		FunctionCalling bool     `json:"function_calling"`
-		Streaming       bool     `json:"streaming"`
 		InputModalities []string `json:"input_modalities"`
 	} `json:"capabilities"`
+}
+
+// modelsResp /models 信封：只保留被消费的字段。
+type modelsResp struct {
+	Data []loomyModel `json:"data"`
 }
 
 // fetchModels 拉取上游模型目录。
@@ -428,6 +435,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			SupportsImages:    m.Capabilities.Vision,
 			SupportsReasoning: m.Capabilities.Reasoning,
 			SupportsTools:     m.Capabilities.FunctionCalling,
+			// 思考档位（issue #96）：上游 /models 的 reasoning_efforts 是权威值，
+			// 原样透传（实测 8 模型均为 none/low/medium/high/xhigh，default=low）
+			ReasoningEfforts:       provider.CleanEfforts(m.ReasoningEfforts),
+			DefaultReasoningEffort: strings.TrimSpace(m.DefaultReasoningEffort),
 		}
 		out = append(out, info)
 	}
@@ -440,7 +451,6 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 	if err != nil {
 		return nil, err
 	}
-	explicit := true
 	out := make([]provider.ModelPricing, 0, len(resp.Data))
 	for _, m := range resp.Data {
 		id := strings.TrimSpace(m.ID)
@@ -448,17 +458,17 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 			continue
 		}
 		rate := priceFromName(m.Name)
-		if rate <= 0 {
-			// 解析不到倍率时必须置 Explicit=false：面板据此显示「未知」而不是「免费」（R5 约定）。
-			explicit = false
-		}
+		// ⚠️ 每轮必须取**新的**变量地址（2026-10-17 修复）：旧实现把 `explicit` 声明在循环外、
+		// 每轮 `&explicit` 后又在末尾复位为 true ⇒ 所有条目共享同一个 bool 且末值恒 true，
+		// 于是「解析不到倍率 → 面板显示未知而不是免费」（R5 约定）**静默失效**。
+		// 现在按本条自己的解析结果取值：解析不到倍率即为 false。
+		explicit := rate > 0
 		out = append(out, provider.ModelPricing{
 			Model:    id,
 			Channel:  ChannelName,
 			Rate:     rate,
 			Explicit: &explicit,
 		})
-		explicit = true
 	}
 	return out, nil
 }
@@ -540,7 +550,22 @@ func parsePoints(rec pointsRecord) (int64, []provider.ResourceItem) {
 		items = append(items, provider.ResourceItem{Name: "积分", Total: *base, Remain: *base, Usable: true})
 	}
 	if daily != nil {
-		items = append(items, provider.ResourceItem{Name: "每日积分", Total: *daily, Remain: *daily, Usable: true})
+		// 每日池「当日有效」：上游**只下发数值、不下发到期时间**。
+		//
+		// 历史：旧实现用 provider.ExpireDateToday() 静态补今天，等于编造一个到期时刻
+		// （用户 2026-10-19 明确要求：上游没给就不显示，不要造）。现在留空串，
+		// 前端「有效期」列自动隐藏该行，且不进「N 小时内到期」分桶（ExpireInstant
+		// 对空串返回 ok=false，调用方自然跳过）。
+		//
+		// 影响面：ledger 差分对 ExpireAt="" 的条目下降时恒归 spend（poolShrankExpiry
+		// 门槛 1 要求 ExpireAt 非空），这正是历史行为（ExpireDateToday() 当日不会
+		// 触发 expired()），故口径不变。
+		items = append(items, provider.ResourceItem{
+			Name:   "每日积分",
+			Total:  *daily,
+			Remain: *daily,
+			Usable: true,
+		})
 	}
 	if v := rec.Data.AvailableBalance; v != nil {
 		return *v, items
@@ -564,11 +589,19 @@ func firstInt(vals ...*int64) *int64 {
 	return nil
 }
 
-// DailyCheckin 实现 provider.Upstream：一期不做签到。
-// 上游有 `/pet-work`（快照）+ `/pet-work/rewards`（领奖），但属"宠物任务"而非明确签到，
-// 且用户已同意签到可豁免（计划 D1）。若二期要做，只需在此实现。
+// DailyCheckin 实现 provider.Upstream（**无业务日**的窄接口）。
+//
+// 本渠道的真实领取是 PET-WORK 领奖，请求体**必须**带服务端业务日 + 配置版本 + 档位
+// （见 checkin.go）。本方法拿不到业务日，故**永远返回错误**，绝不假成功：
+// 返回 nil 会让调度器记一次「已签到」，而实际一分钱没领到。
+//
+// 正确的入口是 DailyCheckinReport（带业务日），调度器在拿到快照后用业务日调用它。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return fmt.Errorf("loomy 暂未实现签到（pet-work 每日任务待二期评估）")
+	return &provider.Error{
+		Kind: provider.ErrClient,
+		Msg: "loomy: 宠物打工领奖需要服务端业务日（/api/v1/pet-work 快照里的 businessDate），" +
+			"不能走无参签到入口；请改用 DailyCheckinReport 或面板的「领取每日积分」",
+	}
 }
 
 // ---------------------------------------------------------------------------

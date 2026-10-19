@@ -128,6 +128,48 @@ func TestQoderEventAmount(t *testing.T) {
 	}
 }
 
+// TestRaccoonEventAmount 小浣熊签到收入（R65）：结构化行仅 claimed 计收入，
+// 且金额取上游回执的实发数额（每日 300，非默认表兜底）。
+//
+// 为什么必须锁：该行形状与 qoder 系共用解析器（reQoderClaimStatus）。若渠道侧
+// 改了日志字段顺序/命名而这里没同步，签到收入会**静默归零**（面板「今日签到收入」
+// 恒 0，但签到状态本身正常显示——比面板失效更隐蔽，同 R34 家族）。
+func TestRaccoonEventAmount(t *testing.T) {
+	s := newTestStats(t)
+	day := todaySlash()
+	path := writeEventLog(t, []string{
+		// 领到 300：入账
+		day + " 10:27:04.000000 raccoon checkin setting_info uid=r1 status=claimed claimed=true amount=300 msg=签到成功 +300（每日积分发放） err=<nil> remain=3896",
+		// 今日已领：无新入账
+		day + " 10:27:05.000000 raccoon checkin setting_info uid=r2 status=already_claimed claimed=false amount=0 msg=今日已领取 err=<nil> remain=3873",
+		// 会话失效：无入账
+		day + " 10:27:06.000000 raccoon checkin setting_info uid=r3 status=no_token claimed=false amount=0 msg=登录态失效，待刷新后重试 err=401 remain=0",
+	})
+	s.RescanEventLog(path)
+	s.RescanEventLog(path) // 幂等：重扫不双计
+	if got := s.Snapshot(time.Now()).CreditIn; got != 300 {
+		t.Fatalf("credit_in = %d, want 300（仅 claimed 计入）", got)
+	}
+}
+
+// TestRaccoonEventShapeNotDegraded 守门：小浣熊签到行必须被**严格正则**识别，
+// 不得落进「形状像但解析不了」的降级态（那意味着收入统计已失准）。
+func TestRaccoonEventShapeNotDegraded(t *testing.T) {
+	s := newTestStats(t)
+	day := todaySlash()
+	path := writeEventLog(t, []string{
+		day + " 10:27:04.000000 raccoon checkin setting_info uid=r1 status=claimed claimed=true amount=300 msg=签到成功 +300 err=<nil> remain=3896",
+		day + " 10:27:05.000000 raccoon checkin setting_info uid=r2 status=already_claimed claimed=false amount=0 msg=今日已领取 err=<nil> remain=3873",
+	})
+	s.RescanEventLog(path)
+	if s.evUnparsed != 0 {
+		t.Fatalf("小浣熊签到行未被严格正则识别：unparsed=%d（收入统计会静默失准）", s.evUnparsed)
+	}
+	if s.evDegraded {
+		t.Fatal("不应进入解析降级态")
+	}
+}
+
 // 结构化新格式：统一行可选 retryable 字段 + qoder 结构化 status 行
 // （仅 claimed 计收入）。旧格式行为由本文件其余事件测试守住（双向兼容）。
 func TestEventFormatsStructured(t *testing.T) {

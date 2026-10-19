@@ -28,10 +28,18 @@ type UsageEntry struct {
 	Ch    string `json:"ch"`            // 渠道 kind（workbuddy/...）
 	UID   string `json:"uid"`           // 账号 uid
 	Model string `json:"model"`         // 客户端请求的原始模型名（含 channel/ 前缀）
-	PT    int64  `json:"pt"`            // prompt/input tokens
+	PT    int64  `json:"pt"`            // prompt/input tokens（**含**缓存命中部分）
 	CT    int64  `json:"ct"`            // completion/output tokens
+	CR    int64  `json:"cr,omitempty"`  // 缓存命中(prompt cache hit) tokens，PT 的子集
+	CRC   bool   `json:"crc,omitempty"` // 上游**是否上报**该维度（区分「未命中 0」与「不提供」）
 	Src   string `json:"src,omitempty"` // upstream=上游返回 | none=无 usage（token 记 0，仅计请求数）
 }
+
+// 关于 CR/CRC 的语义（**不可省**，否则面板会把「不知道」显示成「0%」）：
+//   - CRC=true, CR=0  → 上游明确上报本轮没有缓存命中 ⇒ 利用率显示 0%
+//   - CRC=false, CR=0 → 上游不提供该维度（如 glm/raccoon）⇒ 面板显示「—」
+// 两字段均 omitempty：CRC 为 false 等于老行缺失，故**旧流水向后兼容**
+// （读出来就是「不提供」，面板不显示缓存列值）——符合不变量 5「只增不减」。
 
 // CreditEntry 积分变动流水（按账号条目差分而来，非逐笔精确账）。
 // CreditEntry 单条积分流水（credit-*.jsonl 的一行）。
@@ -73,6 +81,7 @@ func New(dir string) (*Ledger, error) {
 	l := &Ledger{dir: dir}
 	l.migrateDupKeyCredit() // 一次性：归档旧版重复 key 差分错误流水（issue #38）
 	l.cleanup()
+	l.cleanupBodyTrace() // 清理过期的请求体摘要分片（诊断数据保留 7 天）
 	l.trimCurrentMonth() // 裁剪当月文件内 7 天前条目
 	return l, nil
 }
@@ -320,6 +329,11 @@ func (l *Ledger) AutoFlush(stop <-chan struct{}) {
 			return
 		case <-t.C:
 			l.Flush()
+			// 每小时清理一次过期的请求体摘要分片（诊断数据保留 7 天）
+			if now := time.Now().Unix(); now-btClean.Load() >= 3600 {
+				btClean.Store(now)
+				l.cleanupBodyTrace()
+			}
 		}
 	}
 }
@@ -351,6 +365,15 @@ type ModelStat struct {
 	Requests int64  `json:"requests"`
 	PT       int64  `json:"pt"`
 	CT       int64  `json:"ct"`
+	// CR 缓存命中 token 小计；CRCov 是「**上报了该维度**的请求」的 PT 小计；
+	// CRReqs 是上报请求数（前端 title 里展示样本量）。
+	// 利用率 = CR / CRCov 的**加总口径**（不是逐请求平均）：
+	//   - 只把上报请求的 PT 计进分母，不上报的请求不会稀释命中率；
+	//   - 每个请求的命中是其本人 PT 的子集，故加总后 CR ≤ CRCov 恒成立。
+	// CRCov==0 ⇒ 该模型无任何上报样本 ⇒ 面板显示「—」而不进行计算。
+	CR     int64 `json:"cr,omitempty"`
+	CRCov  int64 `json:"cr_cov,omitempty"`
+	CRReqs int64 `json:"cr_reqs,omitempty"`
 }
 
 // RecentCredit 最近一条积分流水（展示用）。
@@ -374,12 +397,18 @@ type Stats struct {
 
 // TokenStats token 口径统计（成功请求）。
 type TokenStats struct {
-	Total    int64       `json:"total"` // pt+ct 合计
-	PT       int64       `json:"pt"`
-	CT       int64       `json:"ct"`
-	Requests int64       `json:"requests"` // 成功请求数（含 src=none 的 0 token 请求）
-	ByDay    []DayTokens `json:"by_day"`   // 按天（days=1 时按小时，Date 为 "HH:00"）
-	ByModel  []ModelStat `json:"by_model"` // 按模型降序
+	Total    int64 `json:"total"` // pt+ct 合计
+	PT       int64 `json:"pt"`
+	CT       int64 `json:"ct"`
+	Requests int64 `json:"requests"` // 成功请求数（含 src=none 的 0 token 请求）
+	// 缓存利用率（全渠道加总口径）与上表同款语义：
+	//   CR    = 命中 token 合计；CRCov = 上报该维度的请求的 PT 合计；
+	//   CRCov==0 ⇒ 窗口内无一个渠道上报缓存字段 ⇒ 面板整体显示「—」。
+	CR      int64       `json:"cr,omitempty"`
+	CRCov   int64       `json:"cr_cov,omitempty"`
+	CRReqs  int64       `json:"cr_reqs,omitempty"` // 上报该维度的请求数（前端可标注样本量）
+	ByDay   []DayTokens `json:"by_day"`            // 按天（days=1 时按小时，Date 为 "HH:00"）
+	ByModel []ModelStat `json:"by_model"`          // 按模型降序
 }
 
 // DayTokens 单日（或单小时）token 分渠道小计。
@@ -462,6 +491,13 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 					st.Token.PT += e.PT
 					st.Token.CT += e.CT
 					st.Token.Requests++
+					// 缓存利用率：只累计**上报了该维度**的请求（CRCov 作分母），
+					// 未上报的请求整条排除——避免用「不知情」的样本稀释命中率。
+					if e.CRC {
+						st.Token.CR += e.CR
+						st.Token.CRCov += e.PT
+						st.Token.CRReqs++
+					}
 					// 模型榜 key 用 "ch/model" 防跨渠道同名模型合并
 					mk := e.Ch + "/" + e.Model
 					ms := models[mk]
@@ -472,6 +508,11 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 					ms.Requests++
 					ms.PT += e.PT
 					ms.CT += e.CT
+					if e.CRC {
+						ms.CR += e.CR
+						ms.CRCov += e.PT
+						ms.CRReqs++
+					}
 					// 今天的小时桶
 					if t.Format("2006-01-02") == now.Format("2006-01-02") {
 						h := hours[t.Hour()]
@@ -512,9 +553,12 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 		st.RecordedSince = time.Unix(ts, 0).Format("2006-01-02")
 	}
 
-	// by_day / by_hour 序列化
+	// by_day / by_hour 序列化。
+	// **横轴必须是整窗固定刻度**（R98）：只列「有过用量的时段」会让曲线随当前时间
+	// 右端一路收缩（今天 11 点看就只画到 11:00），刻度本身随时刻变化、无法横向比较。
+	// 故一律按窗口全枚举补空桶：days=1 ⇒ 00:00~23:00 共 24 个；days=7 ⇒ 窗口内每天一个。
 	if days == 1 {
-		for h := 0; h <= now.Hour(); h++ {
+		for h := 0; h < 24; h++ {
 			a := hours[h]
 			dt := DayTokens{Date: fmt.Sprintf("%02d:00", h), ByChannel: map[string]int64{}}
 			if a != nil {
@@ -523,13 +567,18 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 			st.Token.ByDay = append(st.Token.ByDay, dt)
 		}
 	} else {
-		keys := make([]string, 0, len(days_))
-		for k := range days_ {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			st.Token.ByDay = append(st.Token.ByDay, DayTokens{Date: k, Total: days_[k].total, ByChannel: days_[k].byCh})
+		// 按日期步进而非 map 遍历：缺数据的日期也要有刻度（否则某天没用量就从横轴上消失）。
+		for i := 0; ; i++ {
+			d := time.Date(from.Year(), from.Month(), from.Day()+i, 0, 0, 0, 0, now.Location())
+			if d.After(now) {
+				break
+			}
+			k := d.Format("01-02")
+			dt := DayTokens{Date: k, ByChannel: map[string]int64{}}
+			if a := days_[k]; a != nil {
+				dt.Total, dt.ByChannel = a.total, a.byCh
+			}
+			st.Token.ByDay = append(st.Token.ByDay, dt)
 		}
 	}
 

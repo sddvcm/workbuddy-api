@@ -30,24 +30,32 @@ Claude Code / Codex / Cursor / 任意 OpenAI 兼容客户端
 
 ## 二、功能总览
 
-### 2.1 渠道聚合（12 个）
+### 2.1 渠道聚合（20 个）
 
 | 渠道前缀 | 平台 | 手动签到 | 添加账号方式 |
 |---|---|---|---|
 | `workbuddy/` | WorkBuddy 国内版（CodeBuddy） | ✅ | 浏览器 OAuth / 本机客户端导入 |
 | `workbuddyai/` | WorkBuddy 国际版 | ❌ 自动领日活奖励 | 浏览器 OAuth / 本机客户端导入 |
-| `traework/` | TraeWork | ✅ | 浏览器 OAuth |
-| `traecode/` | Trae 代码版（与 TraeWork 共账号） | — | 同 TraeWork |
 | `qodercn/` | QoderCN | ✅ | 浏览器授权 |
 | `qodercom/` | QoderCOM 国际版 | ✅ | 浏览器授权 |
+| `traework/` | TraeWork | ✅ | 浏览器 OAuth |
+| `traecode/` | Trae 代码版（与 TraeWork 共账号） | — | 同 TraeWork |
 | `qwenwork/` | 千问办公 | ❌ 无签到活动 | 浏览器授权 |
-| `monkeycode/` | MonkeyCode（平台托管模型） | ❌ 无签到端点 | 仅本机客户端导入 |
-| `raccoon/` | 小浣熊 | ❌ 无签到端点 | 浏览器授权 **或** 客户端导入 |
-| `loomy/` | 讯飞 Loomy | ❌ 无签到端点 | 仅本机客户端导入 |
 | `glm/` | 智谱清言 | ✅ | CDP 自动捕获 / 手工粘贴 |
+| `monkeycode/` | MonkeyCode（平台托管模型） | ✅ | 仅本机客户端导入 |
+| `raccoon/` | 小浣熊 | ✅ | 浏览器授权 **或** 客户端导入 |
+| `loomy/` | 讯飞 Loomy | ✅（需当日有效对话轮次） | 仅本机客户端导入 |
+| `officeace/` | OfficeAce（华为云果办） | ✅ | 本机桌面端导入 **或** OAuth |
+| `minimax/` | MiniMax Code 中国版 | ✅ | OAuth 设备码登录 |
+| `lobsterai/` | LobsterAI（有道龙虾） | ✅ | 本机回调 OAuth 登录 |
+| `codearts/` | CodeArts（华为云） | ✅ | PKCE OAuth |
+| `cline/` | Cline 免费池 | ❌ Key 不过期，无需签到 | 粘贴官方 `sk_` API Key |
+| `kilo/` | Kilo AI 免费池 | ❌ 免密、无账号 | 无需添加（自动注入匿名账号） |
+| `gemini/` | Gemini（Google Code Assist） | ❌ 配额为窗口百分比 | OAuth |
+| `zcode/` | ZCode（智谱） | ❌ 积分领取未实现（依赖验证码） | 设备授权登录 |
 | `qoder/` | QoderWork | — | 路由保留，界面已下线 |
 
-**导入型渠道**（`monkeycode`、`raccoon`、`loomy`）的凭据由本项目**不产生**，
+**导入型渠道**（`monkeycode`、`raccoon`、`loomy`、`officeace`）的凭据由本项目**不产生**，
 从已登录的官方客户端读取。这类凭据通常有有效期（如 Loomy 约 14 天），
 到期需重新导入。小浣熊两个路径都支持，弹窗里会同时给出两个按钮。
 
@@ -95,13 +103,27 @@ Claude Code / Codex / Cursor / 任意 OpenAI 兼容客户端
 > ⚠️ 兑换与抽奖会**真实改变账号状态**（抽奖次数用掉不可撤销），
 > 故默认关闭，需在面板显式开启。
 
-### 2.5 自动签到与保活
+### 2.5 一键领取额外补偿
+
+仅 WorkBuddy 国内版提供。上游发放的活动补偿（如「DeepSeek 模型服务异常额外补偿 500 积分」）
+是**按账号**发放的，而个人中心一次只能登录一个账号 —— 账号多的用户逐个登录领取，
+很容易错过截止时间。面板「一键领取额外补偿」对全部账号批量处理：
+
+- **先查状态再领取**：`active` / `claimed` 两个字段决定是否发写请求，
+  已领取、活动未生效的账号不会被无谓打扰（重复点击也安全）
+- **逐账号结果**：每个账号单独报告「本次已领取 / 早已领取 / 活动未生效 / 失败」与截止时间
+- **到账即刷新**：领取完成后自动刷新积分，面板余额立即反映
+
+> 端点与响应形状来自 2026-10-19 对个人中心前端的实测（`/billing/meter/compensation-status`
+> 与 `/billing/meter/claim-compensation`），非猜测。
+
+### 2.6 自动签到与保活
 
 - 每日定时签到领额度，时间点可在面板配置（部分渠道带窗口重试，避开上游活动延迟）
 - Token 保活调度，冷却状态机避免反复打扰上游
 - 积分后台自动刷新，401 掉线自动自愈
 
-### 2.6 用量与积分双流水
+### 2.7 用量与积分双流水
 
 `internal/ledger` 两套**独立口径**的流水，互不折算：
 
@@ -111,13 +133,13 @@ Claude Code / Codex / Cursor / 任意 OpenAI 兼容客户端
 写入仅 append 缓冲（30s 自动 flush），读取时才按月分段扫描聚合，
 **常驻内存接近 0**。首次见到的账号只记一条「存量额度」基线，不逐条展开。
 
-### 2.7 运行统计
+### 2.8 运行统计
 
 面板第三个标签页：今日签到收入 / 花费 / 账号数里程碑、平台概览、
 使用中接棒（粘性路由实时视图）、最近临期与预计作废、模型消耗、
 请求日志（TTFB / 吞吐 / 状态码）、异常账号、运行日志。
 
-### 2.8 安全
+### 2.9 安全
 
 | 项 | 说明 |
 |---|---|
@@ -131,7 +153,7 @@ Claude Code / Codex / Cursor / 任意 OpenAI 兼容客户端
 | **单实例锁** | `CreateMutexW`（`Local\` 命名空间），重复启动立即退出并提示 |
 | **无自动导入凭据** | **不扫描**用户目录、不静默复制任何登录态 —— 账号只能面板登录或手工放置 |
 
-### 2.9 部署形态
+### 2.10 部署形态
 
 - **Windows / macOS**：双击或命令行启动，系统托盘常驻，托盘菜单
   「打开主界面 / 查看日志 / 退出」
@@ -211,7 +233,7 @@ Claude Code / Cursor 等支持自定义 OpenAI 端点的工具直接填即可；
 
 | 分区 | 能做什么 |
 |---|---|
-| **账号** | 添加（按渠道登录/导入）、签到、刷新积分、停用、删除、改昵称、积分明细、成长任务 |
+| **账号** | 添加（按渠道登录/导入）、签到、刷新积分、一键领取额外补偿、停用、删除、改昵称、积分明细、成长任务 |
 | **模型** | 模型目录与费率、复制模型名、导出配置 |
 | **用量** | token 与积分双流水、折线图、模型用量榜 |
 | **统计** | 里程碑、平台概览、临期预警、请求日志、运行日志 |
@@ -277,6 +299,38 @@ WorkBuddy 单渠道、wild-work 没有成长任务体系 —— 任何一方都�
 - panel 的任务领奖端点只在 `WebBase` 域提供，而 wild-work 只有 chat 与 billing
   两个域，不补上则领奖恒返回 400。
 
+### 上游同步记录：wild-work v2.6.2 → v2.9.3（2026-10-19，v0.2.0）
+
+基线追平 `rockswang/wild-work` 的 **v2.9.3**（143 个提交、390 个文件改动、
+约 +7.9 万行）。合并采用「树归一化 + 三方合并」：把上游 `cmd/wild-work/` →
+`cmd/workbuddy-api/`、模块名 `wild-work` → `workbuddy-api` 后再合，避免整仓重命名噪声。
+
+**本次吸收的上游能力**
+
+| 能力 | 说明 |
+|---|---|
+| 新渠道 | Cline、Kilo（免密免费池）、OfficeAce、Minimax、LobsterAI、ZCode、Gemini、CodeArts |
+| backuplink | 决议 R57：单渠道多上游地址的备用通道 |
+| 模型降级链 | `ModelFallback`：命中额度/限流时按规则透明换模型，客户端无感 |
+| 思考强度注入 | `ReasoningEfforts`：按模型注入 reasoning_effort，含 `*` 通配回退 |
+| 会话失效判定 | `SessionDead` + `MarkSessionDead`，配合会话粘性 |
+| 单账号渠道 | `SingleAccount`：无号可轮换时不冷却，原样透传上游错误 |
+| 风控与保护 | loopguard、WAF IP 级 fail-fast、模型级冷却 |
+| 凭据保护 | `internal/officeace` 的 DPAPI 读取（Windows 专属） |
+
+**本地保留、上游没有的部分**（合并时逐处保留）
+
+成长任务体系（`internal/upstream/growth*.go`、`desktop.go`、`mp_report.go`、
+`report.go`）、账号挑号策略（`internal/pool/strategy.go`、`max_rotate`）、
+会话粘性、模型列表的费率后缀（`internal/provider/modelsuffix.go`）、
+`internal/auth` 的 DPAPI 加密落盘、`internal/platform` 单实例锁。
+
+**刻意的分歧**
+
+- `provider.Oczen`：代码与常量保留（跟随上游，便于后续继续合并），但**不登记 Runtime**
+  —— 模型列表、路由、费率面板都不出现该渠道。本仓不再使用 Oczen 匿名通道。
+- `cmd/workbuddy-api/proxy.go`（本地每渠道代理）已被上游 backuplink 取代，删除。
+
 > 再次说明：**本项目不产出、不包含、不分发任何协议逆向研究成果。**
 > 三者都是集成与聚合，各渠道的接口参数、签名算法、风控指纹等底层知识全部来自
 > 下表各上游项目的公开成果；所有逆向相关的功劳与风险归于下述各项目作者。
@@ -321,6 +375,24 @@ WorkBuddy 单渠道、wild-work 没有成长任务体系 —— 任何一方都�
 
 本项目按「现状提供」发布，不作任何明示或默示担保。使用本项目造成的
 账号封禁、额度损失、数据丢失等一切后果由使用者自行承担。
+
+---
+
+## 九、参与贡献
+
+欢迎报 Issue、提 PR。完整指南见 **[CONTRIBUTING.md](CONTRIBUTING.md)**，要点：
+
+- **提 PR 前本地跑三道关**：`go build ./...`、`go test ./...`、
+  `node scripts/ui-static-check.mjs`。CI（`.github/workflows/ci.yml`）对每个 PR 自动跑同样几项
+- **新增渠道必须走完整链路**：`provider` 常量 → `stats` 登记 → `pool` → `gateway` 路由 →
+  `channelOrder` → `feeChannelOrder` → 前端渠道元信息。漏一处不报错，只会静默少一个 tab
+- **提交说明写「为什么」**，涉及取舍把备选方案和放弃原因写进去——这个仓库的历史提交是这么写的
+- **禁止提交任何凭据**（`auths/`、token、cookie、api_key）
+- 本仓库与 `rockswang/wild-work` 保持三方合并关系，改动落在上游同期也改过的文件上时，
+  请在提交说明注明，能省下双方半小时
+
+Issue 模板已按「bug / 功能建议」分好类；不确定是不是 bug 的请走
+[Discussions](https://github.com/sddvcm/workbuddy-api/discussions)，不要占 issue。
 
 ---
 

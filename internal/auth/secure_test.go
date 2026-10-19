@@ -137,7 +137,10 @@ func TestSaveAtomicEncryptsToken(t *testing.T) {
 	if a.AccessToken != "at-secret-value" {
 		t.Errorf("SaveAtomic 污染了内存 token：%q", a.AccessToken)
 	}
-	if doc.Auth.AccessToken == "at-secret-value" {
+	// 与下方 DPAPI 前缀断言同一套守卫：非 Windows 平台 EncryptSecret 是恒等函数，
+	// 落盘天然就是明文，这条断言必须让路（否则 Linux/macOS 上必红）。
+	// 那些平台的行为由 secure_other_test.go 覆盖。
+	if platformEncrypts() && doc.Auth.AccessToken == "at-secret-value" {
 		t.Error("落盘的 accessToken 是明文")
 	}
 	if platformEncrypts() {

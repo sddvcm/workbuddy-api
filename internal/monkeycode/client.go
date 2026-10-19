@@ -41,7 +41,7 @@ type Client struct {
 	// 客户端表现为「突然无响应」。空闲兜底改由 IdleReader 承担。
 	StreamHTTP *http.Client
 	// IdleTimeout 流式空闲超时：连续该时长读不到任何字节即判上游卡死。
-	// 0 = 用 DefaultIdleTimeout。由 main 装配时注入 config.upstream.stream_idle_seconds。
+	// 0 = 用 DefaultIdleTimeout。⚠️ 目前**没有配置项**（main 不注入），实际恒为默认值。
 	IdleTimeout time.Duration
 	Base        string
 	// Console 控制台站点（钱包等 Cookie 认证接口）；空则用 consoleBase。
@@ -138,9 +138,13 @@ func StaticModels() []provider.ModelInfo { return modelInfos() }
 
 // modelInfos 构造静态模型表。
 //
-// ContextWindow/MaxTokens 取自客户端 settings.json 的托管条目（200000 / 32000），
-// 是上游声明的真实容量而非估算，故 ContextFromAPI 置 true —— 让 /v1/models
-// 正常透出容量，客户端据此做上下文预算。
+// 来源标注（issue 报告 #6）：ContextWindow/MaxTokens（200000 / 32000）抄自官方
+// 客户端 settings.json 的托管条目，属上游声明容量，但并非模型目录接口字段——
+// 严格按 provider.go 口径，ContextFromAPI（上游接口返回）与 HandMeasured（本工具
+// 实测）都不完全匹配。仍取 ContextFromAPI=true 的取舍：值确系上游声明而非估算，
+// 两个标志全关会让费用面板按「未知」处理、丢失这批模型的容量展示（/v1/models
+// 不受此标志门控，照常透出）；而 HandMeasured 会给从未实测的值冒充「实测」标注，
+// 更不实。若上游未来下发模型目录接口，应改为真实解析并更新本说明。
 func modelInfos() []provider.ModelInfo {
 	out := make([]provider.ModelInfo, 0, len(staticModels))
 	for _, id := range staticModels {
@@ -558,10 +562,9 @@ func milliCredits(milli int64) int64 {
 	return (milli + 999) / 1000
 }
 
-// DailyCheckin 本渠道无签到活动（渠道声明 noExplicitCheckin，调度器不会调用）。
-func (c *Client) DailyCheckin(_ *auth.Auth) error {
-	return fmt.Errorf("monkeycode 渠道无签到活动")
-}
+// DailyCheckin 见 checkin.go（2026-10-17 起本渠道有签到：POST {console}/api/v1/users/wallet/checkin）。
+// 历史：此前这里返回「本渠道无签到活动」的桩，渠道也因此在前端名单里被列为无签到；
+// 桌面端现身含该端点，故移入 checkin.go 实现。
 
 // Classify 上游错误分类。
 //

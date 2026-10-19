@@ -25,6 +25,9 @@
   "upstream": {
     "timeout_seconds": 120
   },
+  "login": {
+    "lobsterai_callback_port": 0
+  },
   "compat": {
     "default_channel": "workbuddy",
     "max_tokens_cap": 32000,
@@ -33,6 +36,11 @@
       "gpt-5*": "workbuddy/deepseek-v4-pro"
     }
   },
-  "proxies": {
+  "backup_proxy": "",
+  "reasoning_efforts": {},
+  "model_fallback": [],
+  "custom_channels": [],
+  "features": {
+    "loop_guard": true
   }
 }

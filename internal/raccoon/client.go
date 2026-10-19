@@ -32,7 +32,7 @@ type Client struct {
 	// 空闲兜底改由 IdleReader 承担。
 	StreamHTTP *http.Client
 	// IdleTimeout 流式空闲超时：连续该时长读不到任何字节即判上游卡死。
-	// 0 = 用 DefaultIdleTimeout。由 main 装配时注入 config.upstream.stream_idle_seconds。
+	// 0 = 用 DefaultIdleTimeout。⚠️ 目前**没有配置项**（main 不注入），实际恒为默认值。
 	IdleTimeout time.Duration
 
 	// liveMu 保护 liveIDs（动态目录缓存）。
@@ -47,6 +47,9 @@ type Client struct {
 
 	// Base 网关基址（默认 LLMBase）；测试注入 httptest 假上游用，生产不设。
 	Base string
+	// AuthBase 认证/业务基址（默认 BaseURL）；仅测试注入用，生产不设。
+	// 与 Base 分开：刷新走站点根前缀（/api/web/auth/v1/refresh），而推理走 /api/web/llm/v2。
+	AuthBase string
 }
 
 // baseURL 生效的网关基址。
@@ -55,6 +58,14 @@ func (c *Client) baseURL() string {
 		return b
 	}
 	return LLMBase
+}
+
+// authBaseURL 生效的认证/业务基址（refresh / 积分等站点根前缀接口）。
+func (c *Client) authBaseURL() string {
+	if b := strings.TrimRight(strings.TrimSpace(c.AuthBase), "/"); b != "" {
+		return b
+	}
+	return BaseURL
 }
 
 // DefaultIdleTimeout 流式空闲超时默认值（与 loomy 对齐，见其注释）。
@@ -155,24 +166,37 @@ func (c *Client) do(method, url string, a *auth.Auth, body []byte) (*http.Respon
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	rt := strings.TrimSpace(a.RefreshTokenValue())
 	if rt == "" {
+		// 本地无 refresh 可用：客户端文件里可能有活凭证（本渠道与客户端共用会话）。
+		if rerr := RescueFromClientSession(a); rerr == nil {
+			log.Printf("raccoon: 本地 refresh 为空，已采纳本机客户端最新令牌 uid=%s", a.UID)
+			return nil
+		}
 		return fmt.Errorf("raccoon: 无 refresh token，需重新从客户端导入凭据")
 	}
 	payload, err := json.Marshal(map[string]string{"refresh_token": rt})
 	if err != nil {
 		return err
 	}
-	resp, raw, err := c.do(http.MethodPost, BaseURL+EpAuthRefresh, a, payload)
+	// 先试 web 前缀：2026-10-10 实测它是唯一可用端点（electron 旧前缀已 404）。
+	// 404 时回落 electron 前缀，兼容更早的上游版本。
+	base := c.authBaseURL()
+	resp, raw, err := c.do(http.MethodPost, base+EpAuthRefreshWeb, a, payload)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode == http.StatusNotFound {
-		// 桌面端前缀 /api/electron/auth/v1 与代码兜底 /api/web/auth/v1 在不同版本上不同，逐个尝试。
-		resp, raw, err = c.do(http.MethodPost, BaseURL+EpAuthRefreshWeb, a, payload)
+		resp, raw, err = c.do(http.MethodPost, base+EpAuthRefresh, a, payload)
 		if err != nil {
 			return err
 		}
 	}
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// 401/403 的最常见成因：与客户端共用的会话被客户端续期轮换作废（客户端文件里
+		// 始终持有唯一活凭证）。先尝试本机自救，成功即视为刷新成功（调用方会 SaveAtomic）。
+		if rerr := RescueFromClientSession(a); rerr == nil {
+			log.Printf("raccoon: refresh 被拒（疑客户端轮换），已采纳本机客户端最新令牌 uid=%s", a.UID)
+			return nil
+		}
 		return &provider.Error{Kind: provider.ErrSessionDead, Status: resp.StatusCode, Msg: truncate(string(raw), 300)}
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -198,6 +222,19 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	a.ExpiresAt = jwtExp(out.Data.AccessToken)
 	a.Unlock()
 	return nil
+}
+
+// RefreshWithToken 用给定的 refresh_token 换新令牌（不依赖已有 Auth 实例）。
+//
+// 供「网页版登录」在 CDP 捕获 Cookie 后完成**有效性校验 + 令牌获取**两步：
+// 上游 refresh 会轮换 refresh_token，故返回的 refresh 通常与传入值不同，调用方必须落盘
+// （AGENTS §6.20：凡调 RefreshToken 必紧跟 SaveAtomic）。
+func (c *Client) RefreshWithToken(refreshToken string) (access, refresh string, err error) {
+	a := &auth.Auth{RefreshToken: strings.TrimSpace(refreshToken)}
+	if err := c.RefreshToken(a); err != nil {
+		return "", "", err
+	}
+	return a.AccessTokenValue(), a.RefreshTokenValue(), nil
 }
 
 // jwtExp 从 JWT 取 exp（Unix 秒）；解析失败返回 0（NeedsRefresh 会视作需刷新）。
@@ -398,11 +435,8 @@ type catalogModel struct {
 	ModelName         string   `json:"model_name"`
 	Description       string   `json:"description"`
 	DisplayDesc       string   `json:"display_description"`
-	Visible           bool     `json:"visible"`
-	BillingCategory   string   `json:"billing_category"`
 	BillingMultiplier float64  `json:"billing_multiplier"`
 	Tags              []string `json:"tags"`
-	AbilityLevel      int      `json:"ability_level"`
 	Params            struct {
 		ContextWindow int64 `json:"context_window"`
 		MaxTokens     int64 `json:"max_tokens"`
@@ -580,11 +614,6 @@ func parsePointsBalance(d pointsBalanceData) (int64, []provider.ResourceItem) {
 		{Name: "月度积分", Total: d.MonthlyPoints, Remain: d.MonthlyPoints, Usable: true},
 	}
 	return d.AvailablePoints, items
-}
-
-// DailyCheckin 实现 provider.Upstream：小浣熊无签到活动。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return fmt.Errorf("raccoon 无签到活动")
 }
 
 // ---------------------------------------------------------------------------

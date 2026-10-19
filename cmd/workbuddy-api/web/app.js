@@ -91,6 +91,31 @@ function shortUid(uid) {
   return uid.length <= 12 ? uid : uid.slice(0, 6) + "…" + uid.slice(-4);
 }
 
+// fmtDateTime24 时间戳 → "MM-DD HH:MM"（强制 24 小时制，两位补零）。
+// 不用 toLocaleString：它随浏览器 locale/ICU 走，某些环境会渲染成
+// 12 小时制（7:07 PM）或「上午/下午」前缀，与全站 24h 制口径不一致。
+function fmtDateTime24(ts) {
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// fmtLeft 解冻时刻（unix 秒）→ 「剩 X 时 X 分」；已过期返回「即将解冻」。
+// 冷却跨零点时 24h 制绝对时刻（如 10-18 07:07 = 次日清晨）极易被误读成
+// 「19 点被 12 小时制截成 7 点」，并列相对时长后不再歧义。
+function fmtLeft(untilTs) {
+  const sec = untilTs - Date.now() / 1000;
+  if (sec <= 0) return "即将解冻";
+  const m = Math.floor(sec / 60);
+  if (m < 60) return `剩 ${m} 分`;
+  return `剩 ${Math.floor(m / 60)} 时 ${String(m % 60).padStart(2, "0")} 分`;
+}
+
+// shortKey 顶栏 API-Key 中间省略（同 shortUid 风格），完整值存 data-key 供复制。
+function shortKey(k) {
+  return k.length <= 24 ? k : k.slice(0, 6) + "…" + k.slice(-4);
+}
+
 // ---------- 全局状态 ----------
 let state = null;
 
@@ -142,6 +167,7 @@ function liveTagHtml(a) {
 async function loadFees() {
   try {
     const fees = await api("/api/fees");
+    lastFees = fees; // 供模型查找面板取全渠道模型（纯前端，不改后端）
     renderFees(fees);
   } catch (e) { /* 费率接口失败不阻塞 */ }
 }
@@ -151,6 +177,7 @@ async function refreshFees() {
   try {
     await api("/api/fees/refresh", {});
     const fees = await api("/api/fees");
+    lastFees = fees;
     renderFees(fees);
     toast("模型列表和费率已刷新");
   } catch (e) { toast(e.message); } finally {
@@ -158,100 +185,338 @@ async function refreshFees() {
   }
 }
 
-// ---- 一键添加自定义模型（写入 WorkBuddy 的 models.json）----
-//
-// 写入是**整体覆盖**用户的自定义清单，故必须先预览（拿真实的「会覆盖多少条」），
-// 再由用户确认；后端也要求显式 confirm=true 才落盘。
-let mjPreview = null;
+// ---------- 模型查找（纯前端：从最近一次 /api/fees 结果里按关键字过滤） ----------
+// lastFees 最近一次费率接口响应（loadFees/refreshFees 填充）；查找面板读它取全渠道模型。
+let lastFees = null;
 
-// exportModelsJson 预览 → 弹覆盖警告 → 用户确认后写入。
-async function exportModelsJson() {
-  let pv;
-  try {
-    pv = await api("/api/fees/models_json");
-  } catch (e) { toast(e.message); return; }
-
-  if (!pv.api_key_set) {
-    toast("未设置 API Key，无法写入自定义模型");
-    return;
+// collectAllModels 展平全渠道模型，附带裸名/完整 ID（完整 ID = 渠道/模型，即客户端该填的名字）。
+function collectAllModels() {
+  const out = [];
+  for (const ch of (lastFees && lastFees.channels) || []) {
+    for (const m of ch.models || []) {
+      const raw = m.model;
+      const short = raw.includes("/") ? raw.slice(raw.indexOf("/") + 1) : raw;
+      // 完整 ID 一律取服务端给的 m.id（与 /v1/models、provider.PublicModelID 同源）；
+      // 缺字段时退回旧拼接规则（兼容旧后端缓存）：上游 ID 自带命名空间（cline-free/*）
+      // 的渠道由服务端直接透传上游 ID，不再补 `<渠道>/` 前缀（R59）。
+      const full = m.id || (ch.channel && !raw.startsWith(`${ch.channel}/`) ? `${ch.channel}/${raw}` : raw);
+      out.push({ ch: ch.channel, m, short, full });
+    }
   }
-  if (!pv.will_write) {
-    toast("没有可写入的模型：请先点「刷新」获取倍率数据");
-    return;
+  return out;
+}
+
+function openModelSearch() {
+  $("modelSearchOverlay").classList.remove("hidden");
+  const inp = $("modelSearchInput");
+  inp.value = "";
+  renderModelSearch("");
+  inp.focus();
+}
+function closeModelSearch() { $("modelSearchOverlay").classList.add("hidden"); }
+
+// renderModelSearch 按关键字过滤全渠道模型并渲染（对话框固定高度，结果在 .ms-list 内滚动）。
+// 关键字匹配完整 ID 或裸名（大小写不敏感）——两处都包含渠道名，故搜渠道亦可。
+function renderModelSearch(q) {
+  const kw = String(q || "").trim().toLowerCase();
+  const all = collectAllModels();
+  const hit = kw ? all.filter((x) => x.full.toLowerCase().includes(kw) || x.short.toLowerCase().includes(kw)) : all;
+  const box = $("modelSearchList");
+  if (!hit.length) {
+    box.innerHTML = `<div class="ms-empty">${all.length ? "无匹配模型" : "费率数据尚未加载，请点「刷新」后再试"}</div>`;
+  } else {
+    box.innerHTML = hit.map(({ ch, m, short, full }) => {
+      const caps = [m.supports_images ? "👁" : "", m.supports_reasoning ? "🧠" : ""].join("");
+      // 档位小字（issue #96）：上游声明才显示
+      const eff = (m.reasoning_efforts && m.reasoning_efforts.length)
+        ? `<span class="ms-eff" title="思考档位：${esc(m.reasoning_efforts.join("·"))}${m.default_reasoning_effort ? `（默认 ${m.default_reasoning_effort}）` : ""}">${esc(m.reasoning_efforts.join("·"))}</span>` : "";
+      const ctx = (m.has_context && m.context_window)
+        ? `<span title="上下文窗口：${esc(fmtTokensCompact(m.context_window))} tokens（${m.hand_measured ? "本工具实测，仅供参考" : "上游接口返回"}）">(${esc(fmtTokensCompact(m.context_window))}${m.hand_measured ? "*" : ""})</span>` : "";
+      const rate = m.free ? "Free" : (m.priced ? `x${m.rate.toFixed(2)}` : "unknown");
+      return `<div class="ms-row" data-mid="${esc(full)}" role="button" tabindex="0" title="点击复制完整模型 ID：${esc(full)}">`
+        + chBadge(ch)
+        + `<span class="ms-name">${esc(short)}</span>`
+        + `<span class="ms-tags">${ctx}${caps}${eff}</span>`
+        + `<span class="ms-rate">${esc(rate)}</span>`
+        + `</div>`;
+    }).join("");
   }
-  mjPreview = pv;
-  $("mjMsg").innerHTML = modelsJsonConfirmHTML(pv);
-  $("modelsJsonOverlay").classList.remove("hidden");
+  // 底部提示：命中数（结果全量渲染，列表本身可滚动，故不再提示「未显示」）。
+  $("modelSearchFoot").textContent = !all.length ? ""
+    : (hit.length === 0 ? "无匹配" : `共 ${hit.length} 个匹配`);
 }
 
-// modelsJsonConfirmHTML 组装确认文案。覆盖与新建两种情形的措辞完全不同 ——
-// 「会覆盖你 N 条自定义模型」必须显式说出来，不能含糊成「将更新」。
-function modelsJsonConfirmHTML(pv) {
-  const rows = [];
-  rows.push(`<div class="glm-warn">
-    <div class="glm-warn-title">⚠️ ${pv.exists ? "这会覆盖已有的自定义模型清单" : "即将新建自定义模型清单"}</div>
-    <ol>
-      ${pv.exists
-        ? `<li>目标文件已存在，其中 <b>${pv.existing_count}</b> 条自定义模型将被<b>整体覆盖</b>。</li>`
-        : "<li>目标文件不存在，将新建。</li>"}
-      <li>写入前会自动备份为 <code>models.json.bak-时间戳</code>（同目录），但仍建议你自己先备份一份。</li>
-      <li>写入后需在 WorkBuddy 里<b>重启或刷新</b>模型列表才会看到。</li>
-    </ol>
-  </div>`);
-  rows.push(`<div class="hint" style="margin-top:0">
-    将写入 <b>${pv.will_write}</b> 个模型${pv.skipped ? `（另有 ${pv.skipped} 个无倍率模型不写入）` : ""}<br>
-    文件：<code>${esc(pv.path)}</code><br>
-    端点：<code>${esc(pv.endpoint)}</code>
-  </div>`);
-  return rows.join("");
+// ---------- 配置区模糊搜索下拉（combobox）：模型ID / 思考档位输入框复用「查找模型」数据 ----------
+// attachModelPicker 把 <input> 升级为可搜索下拉：focus/input 渲染候选（数据源与「查找模型」
+// 弹层同源——lastFees 缓存展平，字段与文案对齐 renderModelSearch），↑↓ 高亮、Enter 选中、
+// Esc / 失焦 / 点击外部关闭；仍可自由手输（无匹配不强制选择，输入框即 combobox）。
+// opts.onPick(id)：选中回调（缺省=仅回填并关菜单）；
+// opts.enterAction(e)：菜单关闭时按回车的原行为（如「跳到下一个输入框 / 提交」）；
+// opts.stayOpen：多选模式——点选后不关菜单、清空输入、刷新候选（配合 excludeSet 连续多选）；
+// opts.multiAccum：累积多选——逗号分隔逐个追加，过滤关键字取末段、已累积段从候选隐藏；
+// opts.excludeSet()：返回需在候选中完全隐藏的模型集合（完整 ID 精确等值 -> true）。
+let pkOpenMenu = null;
+function pkClose() {
+  document.querySelectorAll(".pk-menu.open").forEach((m) => m.classList.remove("open"));
+  pkOpenMenu = null;
 }
-
-// confirmModelsJson 确认写入（后端同样要求 confirm=true，双保险）。
-async function confirmModelsJson() {
-  if (!mjPreview) { closeModelsJson(); return; }
-  $("btnMjConfirm").disabled = true;
-  try {
-    const r = await api("/api/fees/models_json", { confirm: true });
-    closeModelsJson();
-    toast(r.note || `已写入 ${r.count} 条自定义模型`);
-  } catch (e) {
-    toast(e.message);
-  } finally {
-    $("btnMjConfirm").disabled = false;
+// 点击任意输入框/菜单之外的区域关闭当前下拉（capture 保证先于其他 mousedown 处理器）
+document.addEventListener("mousedown", (e) => {
+  if (!pkOpenMenu) return;
+  if (e.target.closest(".pk-wrap")) return;
+  pkClose();
+}, true);
+// pkHl 命中段高亮（先分段转义再拼 <mark>，与 .ms-list 的 mark 样式共用）
+function pkHl(text, kw) {
+  const k = String(kw || "").trim().toLowerCase();
+  if (!k) return esc(text);
+  const i = String(text).toLowerCase().indexOf(k);
+  if (i < 0) return esc(text);
+  return esc(text.slice(0, i)) + "<mark>" + esc(text.slice(i, i + k.length)) + "</mark>" + esc(text.slice(i + k.length));
+}
+// pkItemHTML 候选项两行富信息：行1 渠道徽标 + 完整 ID（命中段高亮）+ 价格；
+// 行2 上下文窗口（实测带 *）/ 能力图标 / 思考档位（含默认）——与 renderModelSearch 逐字对齐。
+function pkItemHTML(x, kw) {
+  const m = x.m;
+  const caps = (m.supports_images ? "👁" : "") + (m.supports_reasoning ? "🧠" : "");
+  const ctx = (m.has_context && m.context_window) ? `(${esc(fmtTokens(m.context_window))}${m.hand_measured ? "*" : ""})` : "";
+  const eff = (m.reasoning_efforts && m.reasoning_efforts.length)
+    ? esc(m.reasoning_efforts.join("·")) + (m.default_reasoning_effort ? `（默认 ${esc(m.default_reasoning_effort)}）` : "") : "";
+  const rate = m.free ? "Free" : (m.priced ? `x${(+m.rate).toFixed(2)}` : "unknown");
+  return `<div class="pk-item pk-rich" data-id="${esc(x.full)}" title="点击选用 ${esc(x.full)}">`
+    + `<div class="pk-line1">${chBadge(x.ch)}<span class="id">${pkHl(x.full, kw)}</span><span class="rate">${esc(rate)}</span></div>`
+    + `<div class="pk-line2">${ctx}${caps}${eff ? `<span class="pk-eff">${eff}</span>` : ""}</div></div>`;
+}
+function attachModelPicker(input, opts) {
+  opts = opts || {};
+  const wrap = input.closest(".pk-wrap");
+  if (!wrap) return;
+  let menu = wrap.querySelector(".pk-menu");
+  if (!menu) { menu = document.createElement("div"); menu.className = "pk-menu"; wrap.appendChild(menu); }
+  let hlIdx = -1;
+  function render() {
+    let kw, exclude;
+    const baseExcl = opts.excludeSet ? opts.excludeSet() : null;
+    if (opts.multiAccum) {
+      // 累积多选：过滤关键字取末段（最后一个逗号后），已累积段从候选隐藏（精确等值）；
+      // 同时合并 excludeSet（如主力模型ID全局排除），每次 render 实时取——主力列表变更即同步可选范围。
+      const parts = String(input.value || "").split(/[,，]/);
+      kw = (parts[parts.length - 1] || "").trim();
+      exclude = baseExcl ? { ...baseExcl } : {};
+      for (let k = 0; k < parts.length - 1; k++) { const seg = parts[k].trim(); if (seg) exclude[seg] = true; }
+    } else {
+      kw = input.value.trim();
+      exclude = baseExcl;
+    }
+    const kwl = kw.toLowerCase();
+    const all = collectAllModels();
+    const items = all.filter((x) => {
+      if (exclude && exclude[x.full]) return false;
+      if (!kwl) return true;
+      return x.full.toLowerCase().includes(kwl) || x.short.toLowerCase().includes(kwl);
+    });
+    hlIdx = -1;
+    menu.innerHTML = items.length
+      ? items.slice(0, 40).map((x) => pkItemHTML(x, kw)).join("")
+      : `<div class="pk-empty">${all.length ? "无匹配模型（可继续手动输入）" : "费率数据尚未加载，请点「刷新」后再试"}</div>`;
+    menu.classList.add("open");
+    pkOpenMenu = menu;
   }
+  function pick(id) {
+    if (opts.stayOpen && !opts.multiAccum) {
+      // 多选（点选即追加）：回调追加后清空输入继续搜；onPick 可能重建 DOM（重渲染），先判连接
+      if (opts.onPick) opts.onPick(id);
+      if (!input.isConnected) return;
+      input.value = "";
+      render();
+      return;
+    }
+    if (opts.multiAccum) {
+      // 累积多选：选中项替换末段并补逗号，光标留在新末段继续搜索/输入
+      const parts = String(input.value || "").split(/[,，]/);
+      parts[parts.length - 1] = id;
+      input.value = parts.join(",") + ",";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      render();
+      return;
+    }
+    input.value = id;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    pkClose();
+    if (opts.onPick) opts.onPick(id); else input.focus();
+  }
+  function moveHl(d) {
+    const nodes = menu.querySelectorAll(".pk-item");
+    if (!nodes.length) return;
+    hlIdx = (hlIdx + d + nodes.length) % nodes.length;
+    nodes.forEach((n, k) => n.classList.toggle("pk-hl", k === hlIdx));
+    nodes[hlIdx].scrollIntoView({ block: "nearest" });
+  }
+  input.addEventListener("focus", render);
+  input.addEventListener("click", render);
+  input.addEventListener("input", render);
+  input.addEventListener("keydown", (e) => {
+    if (!menu.classList.contains("open")) { if (e.key === "Enter" && opts.enterAction) opts.enterAction(e); return; }
+    // 菜单开着时按键由下拉消化，stopPropagation 防触发 #fbList 上的 Enter 委托（如「回车追加备胎」）
+    if (e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); moveHl(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); moveHl(-1); }
+    else if (e.key === "Escape") { pkClose(); }
+    else if (e.key === "Enter") {
+      e.preventDefault(); e.stopPropagation();
+      const nodes = menu.querySelectorAll(".pk-item");
+      if (hlIdx >= 0 && nodes[hlIdx]) pick(nodes[hlIdx].dataset.id);
+      else if (nodes.length === 1) pick(nodes[0].dataset.id);
+      else { pkClose(); if (opts.enterAction) opts.enterAction(e); }
+    }
+  });
+  // 失焦即关（菜单项 mousedown 已 preventDefault，点菜单项不会先触发 blur）
+  input.addEventListener("blur", () => setTimeout(pkClose, 120));
+  menu.addEventListener("mousedown", (e) => e.preventDefault());
+  menu.addEventListener("click", (e) => {
+    const it = e.target.closest(".pk-item");
+    if (it) pick(it.dataset.id);
+  });
 }
 
-function closeModelsJson() {
-  mjPreview = null;
-  $("modelsJsonOverlay").classList.add("hidden");
+// 思考档位下拉（单选模糊搜索，交互与模型下拉一致；候选为常见档位，仍可自由输入）。
+// 渠道支持什么档位由渠道模型自己决定（后端哑管道不校验），故候选只是输入建议。
+const PK_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"];
+function attachEffortPicker(input, opts) {
+  opts = opts || {};
+  const wrap = input.closest(".pk-wrap");
+  if (!wrap) return;
+  let menu = wrap.querySelector(".pk-menu");
+  if (!menu) { menu = document.createElement("div"); menu.className = "pk-menu"; wrap.appendChild(menu); }
+  let hlIdx = -1;
+  function render() {
+    const kw = input.value.trim().toLowerCase();
+    const list = PK_EFFORTS.filter((t) => !kw || t.includes(kw));
+    hlIdx = -1;
+    menu.innerHTML = list.length
+      ? list.map((t) => `<div class="pk-item" data-id="${t}" title="点击选用 ${t}"><span class="id">${pkHl(t, kw)}</span><span class="pk-ch-tag">档位</span></div>`).join("")
+      : `<div class="pk-empty">无匹配档位（可自由输入）</div>`;
+    menu.classList.add("open");
+    pkOpenMenu = menu;
+  }
+  function pick(id) {
+    input.value = id;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    pkClose();
+    if (opts.onPick) opts.onPick(id); else input.focus();
+  }
+  function moveHl(d) {
+    const nodes = menu.querySelectorAll(".pk-item");
+    if (!nodes.length) return;
+    hlIdx = (hlIdx + d + nodes.length) % nodes.length;
+    nodes.forEach((n, k) => n.classList.toggle("pk-hl", k === hlIdx));
+  }
+  input.addEventListener("focus", render);
+  input.addEventListener("click", render);
+  input.addEventListener("input", render);
+  input.addEventListener("keydown", (e) => {
+    if (!menu.classList.contains("open")) { if (e.key === "Enter" && opts.enterAction) opts.enterAction(e); return; }
+    if (e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); moveHl(1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); moveHl(-1); }
+    else if (e.key === "Escape") { pkClose(); }
+    else if (e.key === "Enter") {
+      e.preventDefault(); e.stopPropagation();
+      const nodes = menu.querySelectorAll(".pk-item");
+      if (hlIdx >= 0 && nodes[hlIdx]) pick(nodes[hlIdx].dataset.id);
+      else if (nodes.length === 1) pick(nodes[0].dataset.id);
+      else { pkClose(); if (opts.enterAction) opts.enterAction(e); }
+    }
+  });
+  input.addEventListener("blur", () => setTimeout(pkClose, 120));
+  menu.addEventListener("mousedown", (e) => e.preventDefault());
+  menu.addEventListener("click", (e) => {
+    const it = e.target.closest(".pk-item");
+    if (it) pick(it.dataset.id);
+  });
 }
 
-// ---------- 积分明细 tooltip ----------
+// ---------- 积分明细浮窗 ----------
 // 明细条数可能很多（TraeWork 每个签到奖励都是独立条目，常见 30+），
 // 故分页展示：每页 DETAIL_PAGE_SIZE 条，页码状态存在 detailState 里，
 // 翻页不重新请求（detailCache 已缓存该账号的完整响应）。
+//
+// 交互：**点击**积分标签打开，✕ / 点击浮窗之外 / Esc 关闭（三个关闭路径都归一到
+// closeCreditDetail）。为什么不用 hover：
+//   ① 浮窗开着时后台 loadState() 会重建卡片 DOM，被替换的元素不再派发 mouseleave
+//      ⇒ 浮窗变成孤儿、关不掉（用户实际遇到的「经常不能自动关闭」就是这个）；
+//   ② 触屏设备不派发 mouseenter/mouseleave，手机上既打不开也关不掉；
+//   ③ hover 模型把「翻页」与「移出即关」耦合成矛盾诉求（要翻页就得移进浮窗）。
 const DETAIL_PAGE_SIZE = 8;
-let detailTimer = null;
 let detailCache = {};
-// detailState 当前 tooltip 的展示状态：{uid, page}。
-// detailState 当前 tooltip 的展示状态：{uid, page}。
+// detailState 当前浮窗的展示状态：{uid, page}。
 let detailState = null;
+// detailOpenSeq 打开序号：快速连点两个账号时，只让「最后一次点击」的响应上屏。
+// 取代了 hover 版靠 detailTimer 的竞态守卫（点击式没有「等待期间鼠标移开」这回事）。
+let detailOpenSeq = 0;
+
+// closeCreditDetail 关闭浮窗（唯一的关闭入口，X / 点外部 / Esc / 切 tab 都走它）。
+function closeCreditDetail() {
+  const tip = $("creditTip");
+  if (tip) tip.style.display = "none";
+  detailOpenSeq++; // 让在途的明细请求失效，避免关掉后又被异步回调弹出来
+}
+
+// bindCreditDetailDismiss 绑定浮窗的外部关闭路径（绑定一次）。
+// 为什么用 document 级委托而不是给每个入口挂 handler：浮窗与卡片都是动态重建的，
+// 委托不受重建影响——这正是旧 hover 实现的失效根源（元素换掉后监听器一起消失）。
+function bindCreditDetailDismiss() {
+  document.addEventListener("click", (e) => {
+    const tip = $("creditTip");
+    if (!tip || tip.style.display === "none") return;
+    // 归属判定必须用事件传播路径（composedPath），不能用 e.target.closest：
+    // showCreditDetail → syncCreditsFromDetail 会在本次派发途中重写积分格 innerHTML，
+    // 把被点的 SPAN 从 DOM 摘掉；detached 节点的 closest() 恒为 null，
+    // 会让「点另一个账号的标签」被误判成「点外部」而把刚打开的浮窗关掉。
+    // composedPath 在派发时就已固化，不受中途 DOM 替换影响。
+    const path = e.composedPath ? e.composedPath() : [];
+    const inPath = (pick) => path.some((n) => n instanceof Element && pick(n));
+    if (inPath((n) => n.getAttribute("data-close-credit-tip") === "1")) { closeCreditDetail(); return; }
+    if (path.includes(tip) || tip.contains(e.target)) return;          // 浮窗内部（含翻页）不关
+    if (inPath((n) => n.classList.contains("acct-credits"))) return;   // 点另一个账号的标签 = 切换，不关
+    closeCreditDetail();                                               // 其余任何位置都关
+  });
+  // Esc 关闭：与其它弹层（设置/帮助/查找模型）的键盘行为一致
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeCreditDetail(); });
+}
 
 async function showCreditDetail(e, uid) {
-  const el = e.currentTarget;
-  if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+  // e（内联 onclick 传入的 event）刻意只作占位：浮窗位置由 CSS 固定（水平居中、距顶 12vh），
+  // 不需要锚定元素。**不要**在这里取 `e.currentTarget` —— 它在下面第一个 `await` 之后恒为
+  // null（事件派发早已结束），留着只会误导后来者（2026-10-17 清理掉一处这样的死代码）。
+  const seq = ++detailOpenSeq; // 本次打开的身份；被更晚的打开或关闭动作作废时不再上屏
 
-  // 切换到另一个账号时重置页码；同一账号重复 hover 保留原页码。
+  // 切换到另一个账号时重置页码；同一账号重复点击保留原页码。
   const page = (detailState && detailState.uid === uid) ? detailState.page : 0;
 
   let d = detailCache[uid];
   if (!d) {
     try {
       d = await api("/api/account/resource_detail", { uid });
+      // 竞态守卫：等待接口期间用户又点了别的账号 / 关闭了浮窗 → 本次结果作废。
+      if (seq !== detailOpenSeq) return;
       detailCache[uid] = d;
-    } catch (err) { return; }
+      syncCreditsFromDetail(uid, d);
+    } catch (err) {
+      // 不再静默 return：接口失败以前什么都不显示，用户完全不知道发生了什么事。
+      // 后端对 oczen / kilo / 自定义渠道直接 400（「无积分，不适用」），其余是网络/
+      // 上游错误——两类都必须把原因摆到用户面前（浮窗 + toast 双通道：
+      // 浮窗贴在被点的位置、常驻；toast 兜住浮窗可能被下一次点击关掉的情形）。
+      if (seq !== detailOpenSeq) return;
+      const msg = (err && err.message) ? err.message : "积分明细获取失败";
+      renderCreditTipNotice(msg);
+      toast(`积分明细获取失败：${msg}`);
+      return;
+    }
   }
-  if (!d || !d.items || !d.items.length) return;
+  // 同理：请求成功但一件明细都没有（渠道没下发条目）也必须给出可见解释，不再静默返回。
+  if (!d || !d.items || !d.items.length) {
+    renderCreditTipNotice("该账号暂无可展示的积分明细（上游未下发条目）。");
+    return;
+  }
 
   let tip = $("creditTip");
   if (!tip) {
@@ -261,17 +526,50 @@ async function showCreditDetail(e, uid) {
     document.body.appendChild(tip);
   }
 
-  const rect = el.getBoundingClientRect();
+  // 位置由 CSS 固定（水平居中、距顶 12vh）：不再跟着被点卡片算 left/top，
+  // 这样后台重渲染、滚动都不会让浮窗跑偏，也避免窄屏越界。
   detailState = { uid, page };
   renderCreditDetail();
-  // 先渲染再量尺寸，才能决定向上还是向下弹出。
-  const h = tip.offsetHeight;
-  let top = rect.bottom + 4;
-  if (top + h > window.innerHeight) top = Math.max(4, rect.top - h - 4);
-  let left = rect.left;
-  if (left + tip.offsetWidth > window.innerWidth) left = Math.max(4, window.innerWidth - tip.offsetWidth - 10);
-  tip.style.left = left + "px";
-  tip.style.top = top + "px";
+  tip.style.display = "block";
+}
+
+// syncCreditsFromDetail 把卡片与汇总条的积分数字回写成明细响应的同源代码。
+// 顶层原本是 pool 快照（仅刷新事件/30min 自动循环更新），明细是 hover 实时值，
+// 区间内消耗会让「同屏两个数字对不上」；后端 ResourceDetail 现已把同一响应回写
+// pool 快照，前端这里再把卡片与汇总条改为同源——弹层展开那一刻全屏数字一致。
+// 只改展示状态与对应 DOM，不重请求、不全量重绘（全量重绘会替换正在 hover 的
+// 卡片节点，tooltip 锚点与鼠标事件会丢）。
+function syncCreditsFromDetail(uid, d) {
+  const a = (state.accounts || []).find((x) => x.uid === uid);
+  if (!a || a.credits_na) return;
+  a.credits = d.usable_remain || 0;
+  a.unusable_credits = d.unusable_remain || 0;
+  a.expiring_credits = d.expiring_remain || 0;
+  a.credits_stale = false;
+  const cell = document.querySelector(`.acct-credits[data-uid="${uid}"]`);
+  if (cell) cell.innerHTML = creditsText(a);
+  renderSummary();
+}
+
+// renderCreditTipNotice 在浮窗里显示一条可见提示（替代「静默什么都不发生」）。
+// 为什么必须用浮窗而不用 toast：toast 3 秒后消失且位置在页面底部，用户点的是卡片上的
+// 某个数字，反馈必须出现在「他刚点的那个地方」，否则容易被当成没反应。
+// 提示条沿用浮窗壳子（关闭按钮/点外部/Esc 全部照常），只是正文换成一行说明。
+function renderCreditTipNotice(msg) {
+  let tip = $("creditTip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "creditTip";
+    tip.className = "credit-tip";
+    document.body.appendChild(tip);
+  }
+  tip.innerHTML = `<div class="detail-head">`
+    + `<span class="detail-count"></span>`
+    + `<span class="detail-pager"></span>`
+    + `<span class="detail-title">积分明细</span>`
+    + `<button type="button" class="detail-close" data-close-credit-tip="1" title="关闭" aria-label="关闭积分明细">✕</button>`
+    + `</div><div class="detail-empty">${esc(msg)}</div>`;
+  tip.style.display = "block";
 }
 
 // renderCreditDetail 按 detailState 重绘 tooltip（含分页控件与可用/不可用小计）。
@@ -279,9 +577,54 @@ function renderCreditDetail() {
   const tip = $("creditTip");
   if (!tip || !detailState) return;
   const d = detailCache[detailState.uid];
-  if (!d || !d.items || !d.items.length) return;
+  // 空明细不能静默 return：此前这里直接返回，用户点了积分数字后浮窗不出现也没有任何解释
+  // （典型：渠道有积分但没有下发条目、或该账号额度桶为空）。改为在浮窗里说明。
+  if (!d || !d.items || !d.items.length) {
+    renderCreditTipNotice("该账号暂无可展示的积分明细（上游未下发条目）。");
+    return;
+  }
 
-  const items = d.items;
+  const items = d.items.slice();
+  // 临期判定与后端 provider.ExpireWithinDays 同口径：**自然日**（阈值天数内到期）。
+  // 判据 = 失效时刻 - 零点宽限 所属自然日 ≤ 今天+days（次日 00:00 失效算今日）。
+  const expDays = state.expiring_days || 1;
+  // expireInstantUtc 失效时刻的真实 UTC 毫秒，与后端 provider.ExpireInstant 同口径：
+  //   日期粒度（YYYY-MM-DD）= 该日全天可用 ⇒ **次日 00:00（UTC+8）**才失效；
+  //   RFC3339 = 精确时刻（如 gemini 的配额窗口重置、workbuddy 的 CycleEndTime）。
+  // 解析不出返回 null（该条目无到期信息）。旧实现用 split("-") + Number()，遇到
+  // RFC3339 会得到 NaN 静默退化，故统一收口到这里。
+  const EXPIRE_MIDNIGHT_GRACE_MS = 5 * 60 * 1000; // 与后端 expireMidnightGrace 同值
+  const expireInstantUtc = (s) => {
+    if (!s) return null;
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    // 纯日期：该日全天可用 ⇒ 次日零点失效（后端 ExpireInstant 的 t.AddDate(0,0,1)）
+    if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3] + 1) - 8 * 3600 * 1000;
+    const t = Date.parse(s);
+    return Number.isNaN(t) ? null : t;
+  };
+  // 失效时刻所属「自然日」的 UTC 毫秒（已扣零点宽限）：次日 00:00:03 归前一天。
+  const expireDayUtc = (s) => {
+    const ms = expireInstantUtc(s);
+    if (ms === null) return null;
+    const d = new Date(ms - EXPIRE_MIDNIGHT_GRACE_MS + 8 * 3600 * 1000);
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) - 8 * 3600 * 1000;
+  };
+  const nowCst = new Date(Date.now() + 8 * 3600 * 1000);
+  const todayUtc = Date.UTC(nowCst.getUTCFullYear(), nowCst.getUTCMonth(), nowCst.getUTCDate()) - 8 * 3600 * 1000;
+  // 临期：失效自然日 ≤ 今天 + expDays 天（含），且尚未失效
+  const isExpiring = (s) => {
+    const day = expireDayUtc(s), inst = expireInstantUtc(s);
+    if (day === null || inst === null) return false;
+    if (inst <= Date.now()) return false;
+    return day <= todayUtc + expDays * 24 * 3600 * 1000;
+  };
+  // 排序：临期（可消耗、有剩余、窗口内到期）→ 可用 → 已用完/不可用/仅展示垫底；组内按到期日升序。
+  const expUtcOf = (it) => {
+    const ms = expireInstantUtc(it.expire_at);
+    return ms === null ? Infinity : ms;
+  };
+  const groupOf = (it) => (it.usable && it.remain > 0) ? (isExpiring(it.expire_at) ? 0 : 1) : 2;
+  items.sort((a, b) => groupOf(a) - groupOf(b) || expUtcOf(a) - expUtcOf(b));
   const pages = Math.max(1, Math.ceil(items.length / DETAIL_PAGE_SIZE));
   const page = Math.min(Math.max(0, detailState.page), pages - 1);
   detailState.page = page;
@@ -301,22 +644,54 @@ function renderCreditDetail() {
     html += `<span class="detail-pg${page >= pages - 1 ? " off" : ""}" data-pg="${page + 1}">›</span>`;
     html += `</span>`;
   }
-  html += `<span class="detail-title">积分明细</span></div>`;
+  // 标题随计量单位切换：token 渠道不叫「积分明细」（避免把 token 数当积分读）。
+  // ⚠️ 账号必须由 detailState.uid 取（本函数的单一数据源）：`uid` 是 showCreditDetail 的
+  // **形参**，不在本函数作用域内。此处曾写成 `x.uid === uid` ⇒ ReferenceError: uid is not
+  // defined，抛在下面的 `tip.innerHTML = html` 之前 ⇒ 浮窗 display:block 但内容为空，
+  // 用户看到的就是「点积分数字什么都不出现」（发布级回归，由 scripts/ui-static-check.mjs 锁死）。
+  const detailAcct = (state.accounts || []).find((x) => x.uid === detailState.uid);
+  const detailIsToken = !!(detailAcct && detailAcct.credits_unit === "token");
+  html += `<span class="detail-title">${detailIsToken ? "Token 额度明细" : "积分明细"}</span>`;
+  // 关闭按钮：桌面与触屏共用同一入口（触屏没有 hover，只能靠显式按钮）
+  html += `<button type="button" class="detail-close" data-close-credit-tip="1" title="关闭" aria-label="关闭积分明细">✕</button>`;
+  html += `</div>`;
   html += `<table class="detail-table"><thead><tr><th>套餐</th><th>总额</th><th>已用</th><th>剩余</th>`;
   if (hasExpiry) html += `<th>有效期</th>`;
   html += `</tr></thead><tbody>`;
   for (const it of slice) {
     // 不可用额度整行淡显 + 角标，与可用额度区分开（如 TraeWork 的官方客户端专用池）。
-    const cls = it.usable ? "" : ' class="detail-unusable"';
+    let cls = it.usable ? "" : ' class="detail-unusable"';
     let tag = "";
     if (!it.usable) {
       tag = '<span class="detail-tag" title="该额度仅供官方客户端使用，本工具无法消耗">不可用</span>';
+    } else if (it.unit === "token") {
+      // Token 计量（ZCode 的额度桶、MonkeyCode 的每日 Token 额度）：明示单位，不计入积分合计。
+      tag = '<span class="detail-tag" title="以 token 计量，不计入积分合计">tokens</span>';
     } else if (it.info_only) {
-      // 单位与积分不同（如 MonkeyCode 的每日 Token 额度）：展示但不计入合计。
+      // 其它「单位与积分不同」的展示型条目：展示但不计入合计。
       tag = '<span class="detail-tag" title="单位与积分不同，仅作展示，不计入合计">仅展示</span>';
     }
-    html += `<tr${cls}><td>${esc(it.name)}${tag}</td><td>${it.total}</td><td>${it.used}</td><td>${it.remain}</td>`;
-    if (hasExpiry) html += `<td>${it.expire_at ? esc(it.expire_at) : "-"}</td>`;
+    // 临期条目（可消耗且有剩余、窗口内到期，与后端 ExpiringWithin 余额口径一致）：
+    // 整行淡红底 + 到期日红字 + 临期红章；已用完（remain=0）不标临期，避免与汇总口径打架。
+    let expCell = "-", expCellCls = "";
+    if (it.usable && it.remain > 0 && it.expire_at) {
+      const expUtc = expireInstantUtc(it.expire_at);
+      if (expUtc !== null) {
+        if (isExpiring(it.expire_at)) {
+          expCell = `${esc(it.expire_at)}<span class="detail-exp-tag" title="${expDays} 天内到期，优先消耗">临期</span>`;
+          expCellCls = ' class="detail-exp"';
+          cls = ' class="detail-exp-row"';
+        } else {
+          expCell = esc(it.expire_at);
+        }
+      } else {
+        expCell = esc(it.expire_at);
+      }
+    }
+    // Token 条目用紧凑单位显示（上亿数字直接铺开会撑破表格）。
+    const cellNum = (v) => (it.unit === "token" ? fmtTokens(v) : v);
+    html += `<tr${cls}><td>${esc(it.name)}${tag}</td><td>${cellNum(it.total)}</td><td>${cellNum(it.used)}</td><td>${cellNum(it.remain)}</td>`;
+    if (hasExpiry) html += `<td${expCellCls}>${expCell}</td>`;
     html += `</tr>`;
   }
   html += `</tbody></table>`;
@@ -331,28 +706,15 @@ function renderCreditDetail() {
   tip.innerHTML = html;
   tip.style.display = "block";
 
-  // 翻页：只改状态重绘，不重新请求接口。事件重挂由 hideCreditDetail 统一负责。
+  // 翻页：只改状态重绘，不重新请求接口。关闭路径由 bindCreditDetailDismiss 统一接管。
   tip.querySelectorAll(".detail-pg").forEach((btn) => {
     if (btn.classList.contains("off")) return;
     btn.onclick = (ev) => {
       ev.stopPropagation();
-      if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; } // 翻页即取消关闭
       const target = Number(btn.dataset.pg);
       if (Number.isFinite(target)) { detailState.page = target; renderCreditDetail(); }
     };
   });
-}
-
-function hideCreditDetail() {
-  detailTimer = setTimeout(() => {
-    const tip = $("creditTip");
-    if (tip) tip.style.display = "none";
-  }, 300);
-  const tip = $("creditTip");
-  if (tip) {
-    tip.onmouseenter = () => { if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; } };
-    tip.onmouseleave = () => { tip.style.display = "none"; };
-  }
 }
 
 // ---------- 渲染 ----------
@@ -387,33 +749,164 @@ function renderTopbar() {
     : "点击复制地址";
 
   const key = state.api_key;
-  $("apiKeyDisplay").querySelector(".val").textContent = key === "" ? "（无鉴权）" : key;
+  const keyEl = $("apiKeyDisplay");
+  const keyVal = keyEl.querySelector(".val");
+  if (key === "") {
+    keyVal.textContent = "（无鉴权）";
+    delete keyEl.dataset.key;
+    keyEl.title = "当前未设置 API-Key";
+  } else {
+    // 脱敏显示：中间省略，完整值存 data-key 供一键复制（防旁人瞟屏）
+    keyEl.dataset.key = key;
+    keyVal.textContent = shortKey(key);
+    keyEl.title = "完整 API-Key：" + key + "；点击复制；进入设置修改";
+  }
 }
 
 // 渠道显示名与 CSS 短类名（后端 group / 费率 channel 均为 provider.Kind）。
-const CH_LABEL = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", traecode: "TraeCode", qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言", monkeycode: "MonkeyCode", raccoon: "小浣熊", loomy: "Loomy" };
-const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", traecode: "traecode", qoder: "qoder", qodercn: "qodercn", qodercom: "qodercom", qwenwork: "qwenwork", glm: "glm", monkeycode: "monkeycode", raccoon: "raccoon", loomy: "loomy" };
-const chLabel = (k) => CH_LABEL[k] || "WorkBuddy";
-const chClass = (k) => CH_CLASS[k] || "wb";
+const CH_LABEL = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", traecode: "TraeCode", qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言", monkeycode: "MonkeyCode", raccoon: "小浣熊", loomy: "Loomy", oczen: "OpenCodeZen", kilo: "Kilo", minimax: "MiniMax", lobsterai: "LobsterAI", zcode: "ZCode", gemini: "Gemini", codearts: "CodeArts", cline: "Cline", officeace: "OfficeAce" };
+const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", traecode: "traecode", qoder: "qoder", qodercn: "qodercn", qodercom: "qodercom", qwenwork: "qwenwork", glm: "glm", monkeycode: "monkeycode", raccoon: "raccoon", loomy: "loomy", oczen: "oczen", kilo: "kilo", minimax: "minimax", lobsterai: "lobsterai", zcode: "zcode", gemini: "gemini", codearts: "codearts", cline: "cline", officeace: "officeace" };
+const chLabel = (k) => CH_LABEL[k] || k;
+const chClass = (k) => CH_CLASS[k] || "custom";
+// ---------- 图表配色：与徽章同源，但保证同图任意两条线颜色可辨 ----------
+// 自定义渠道无品牌色，多个自定义渠道若共用 --ch-custom 会完全撞色，故按
+// 「在 state.custom_channels 里的序号」用黄金角均分色相（不绑品牌色）。
+// 不用固定长度色池：色池在渠道数超过池长时必然撞色，哈希取模也可能让少量
+// 渠道就落进同一桶。黄金角（137.508°）保证任意数量下相邻序号色相间隔最大；
+// 明度从 42% 往下压到白字对比 ≥4.5（黄/绿色相天然更亮，需压更多）。
+// ⚠️ 这些色只保证**彼此**可辨，与内建 --ch-* 色板存在 ΔE2000 < 7 的近邻
+//   （前几个序号恰好贴着 officeace / cline / traecode / minimax），同图出现时
+//   仍可能混淆 —— 内建色板改色后需重新核对这一交叉。
+const CUSTOM_GOLDEN_ANGLE = 137.508;
+const _customColorCache = {};
+function relLuminance(hex) {
+  const v = [1, 3, 5].map((i) => parseInt(hex.substr(i, 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+}
+function customChannelColor(k, list) {
+  // list 显式传入用于「自定义渠道编辑弹窗」：那里渲染的是 editCustomChannels（未保存的
+  // 新渠道也在里面），不能读 state.custom_channels —— 否则新渠道一律 idx=0、全同色。
+  const arr = list || (state && state.custom_channels) || [];
+  const found = arr.findIndex((c) => c && c.name === k);
+  const idx = found < 0 ? arr.length : found;
+  // 缓存键必须带 idx：按序号取色，删/调序后同名渠道的色号会变，
+  // 只按渠道名缓存会返回过期颜色（两个渠道撞色且与列表序号对不上）。
+  const ck = `${k}#${idx}`;
+  if (_customColorCache[ck]) return _customColorCache[ck];
+  const hue = (idx * CUSTOM_GOLDEN_ANGLE) % 360;
+  // 明度从 42% 逐级下压，直到白字对比 ≥4.5（黄/绿最亮，要压到 28% 左右）
+  let hex = hslToHex(hue, 78, 42);
+  for (let l = 42; l >= 22; l--) {
+    hex = hslToHex(hue, 78, l);
+    if (1.05 / (relLuminance(hex) + 0.05) >= 4.5) break;
+  }
+  return (_customColorCache[ck] = hex);
+}
+const _chColorCache = {};
+function chColor(k, list) {
+  if (isCustomGroup(k) || (list && list.some((c) => c && c.name === k))) {
+    return customChannelColor(k, list);
+  }
+  const cls = CH_CLASS[k] || "custom";
+  if (_chColorCache[cls]) return _chColorCache[cls];
+  let v = "";
+  try { v = getComputedStyle(document.documentElement).getPropertyValue(`--ch-${cls}`).trim(); } catch (e) { /* ignore */ }
+  return (_chColorCache[cls] = v || "#6366f1");
+}
+
+// chBadge 渠道徽章的唯一渲染入口（R99）：
+//   底色一律取 chColor()，与折线图 series 同源——两处不可能漂移。
+//   内建渠道的 chColor() 读 --ch-<类名>（CSS 里仍有 .badge.x 做无 JS 兜底），
+//   自定义渠道读 customChannelColor() 的黄金角自适应色，故必须内联 background
+//   （否则它们全共用 .badge.custom 的单一革蓝，与图上颜色对不上）。
+// ⚠️ 全仓只此一处拼 badge 的 class 与底色：手写 `<span class="badge x">` 会让
+//   自定义渠道退回 .badge.custom、并让 applyAcctFilter 的类名反查失效。
+function chBadge(k, list) {
+  return `<span class="badge ${chClass(k)}" style="background:${chColor(k, list)}">${esc(chLabel(k))}</span>`;
+}
+// varyColor 同渠道第 i（0 起）个系列做颜色变体，避免同渠道多条线同色：
+// 明度阶梯 +14/-14/+28/-28... 封顶在 [22,78]；封顶后转色相偏移（每档 ±18°）继续拉开。
+function hexToHsl(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = ((n >> 16) & 255) / 255, g = ((n >> 8) & 255) / 255, b = (n & 255) / 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+  if (mx === mn) return { h: 0, s: 0, l: l * 100 };
+  const d = mx - mn, s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+  let h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return { h: h * 60, s: s * 100, l: l * 100 };
+}
+function hslToHex(h, s, l) {
+  const f = (n) => {
+    const k2 = (n + h / 30) % 12;
+    const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+    const c = l / 100 - a * Math.max(-1, Math.min(k2 - 3, Math.min(9 - k2, 1)));
+    return Math.round(c * 255).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+function varyColor(hex, i) {
+  if (!i || !/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
+  const { h, s, l } = hexToHsl(hex);
+  const k = Math.ceil(i / 2), dir = i % 2 ? 1 : -1;
+  const lRaw = l + k * 14 * dir;
+  const l2 = Math.min(78, Math.max(22, lRaw));
+  const hShift = (lRaw < 22 || lRaw > 78) && k >= 2 ? k * 18 * dir : 0;
+  return hslToHex(((h + hShift) % 360 + 360) % 360, s, l2);
+}
 // 不支持显式签到（手动按钮）的渠道：
 // WorkBuddy 国际版不提供手动签到，而是自动对话保活领日活奖励；
-// 千问办公无签到活动；MonkeyCode / 小浣熊 / Loomy 均无签到端点。
-const NO_EXPLICIT_CHECKIN = new Set(["workbuddyai", "qwenwork", "monkeycode", "raccoon", "loomy"]);
-const noExplicitCheckin = (g) => NO_EXPLICIT_CHECKIN.has(g);
+// 千问办公无签到活动；OpenCodeZen 与 Kilo 是免密渠道，
+// 无账号概念（也无积分）。
+// 小浣熊已实现签到（setting_info 触发每日积分落账，见 internal/raccoon/checkin.go），支持手动按钮。
+// MonkeyCode 已实现签到（POST {console}/api/v1/users/wallet/checkin，见 internal/monkeycode/checkin.go），
+// 故**不在**本名单内：它要有手动按钮，也要参与批量签到。
+// Loomy 同样已实现签到（宠物每日打工奖励，见 internal/loomy/checkin.go），故也在名单外。
+// 注意：Loomy 的奖励判据是「当日有效对话轮次」（上游算），未在官方客户端用过该账号时
+// 领取结果会是「未达档位」——那是如实状态，不是按钮坏了。
+const NO_EXPLICIT_CHECKIN = new Set(["workbuddyai", "qwenwork", "oczen", "kilo", "zcode", "gemini", "cline"]);
+const noExplicitCheckin = (g) => NO_EXPLICIT_CHECKIN.has(g) || isCustomGroup(g); // 自定义渠道无签到活动（R66）
+// isCustomGroup 该分组是否为用户自定义 OpenAI 兼容渠道（R66）。
+// 以 state.custom_channels（后端 /api/state 下发，保存即热更新）为准，勿在前端另维护一份。
+const isCustomGroup = (g) => !!(state && (state.custom_channels || []).some((c) => c && c.name === g));
+// hasNoCredits 该分组是否无积分概念：内建 NA 名单 ∪ 动态自定义渠道。与后端 creditsNAKind 同口径。
+const hasNoCredits = (g) => NO_CREDITS_BUILTIN.has(g) || isCustomGroup(g);
 // 导入型渠道：凭据由本机已登录的官方客户端提供，没有浏览器登录流程（见 internal/app/import_local.go）。
-const IMPORT_LOCAL_CHANNELS = new Set(["monkeycode", "raccoon", "loomy"]);
+const IMPORT_LOCAL_CHANNELS = new Set(["monkeycode", "raccoon", "loomy", "officeace"]);
 const isImportLocal = (ch) => IMPORT_LOCAL_CHANNELS.has(ch);
-// 支持「浏览器授权登录」的渠道：登录期间临时把该渠道的自定义协议回调指向本工具，
-// 以便接住授权码并完成 token 兑换。
-// 小浣熊两个集合都命中 —— 弹窗里同时给「浏览器授权登录」与「从客户端导入」两个动作。
-const PROTOCOL_LOGIN_CHANNELS = new Set(["raccoon"]);
-const hasProtocolLogin = (ch) => PROTOCOL_LOGIN_CHANNELS.has(ch);
-// 无手动签到渠道的状态文案：国际版是「自动领日活奖励」，千问办公为「无签到」。
-const NO_CHECKIN_TAG = { workbuddyai: "自动领日活奖励" };
+// 支持「网页版自动登录」的渠道：后端拉起独立 profile 的浏览器，用户在网页里登录，
+// 后端经 CDP 捕获凭据（小浣熊：Cookie 里的 xhx_token）。
+// 小浣熊两个集合都命中 —— 弹窗里同时给「网页版登录」与「从客户端导入」两个动作。
+// Loomy 也两个集合都命中，但机制不同：**不**拉浏览器、**不**用 CDP 捕获，而是起一个
+// 127.0.0.1 的本机登录引导页（手机号 + 短信验证码），由前端 window.open 打开
+// （见 internal/login_loomy）。故文案需按渠道区分，不能套用小浣熊那段。
+const WEB_LOGIN_CHANNELS = new Set(["raccoon", "loomy"]);
+const hasWebLogin = (ch) => WEB_LOGIN_CHANNELS.has(ch);
+// 粘贴凭据型渠道：没有浏览器登录编排，凭据由用户从官方站点自行创建后粘贴进来。
+// Cline：app.cline.bot → 注册账号 → Account / API Keys 建 sk_ Key（见 internal/cline）。
+const PASTE_KEY_CHANNELS = new Set(["cline"]);
+const isPasteKey = (ch) => PASTE_KEY_CHANNELS.has(ch);
+// 无手动签到渠道的状态文案：每个在 NO_EXPLICIT_CHECKIN 里的渠道都要有一条
+// （漏写就落兜底的「无签到」，把「每日积分自动发放」说成「不支持」）。
+const NO_CHECKIN_TAG = {
+  workbuddyai: "自动领日活奖励",
+  qwenwork: "每日自动发放", // 积分由服务端 00:00 被动发放，无领取动作
+  oczen: "不支持",
+  kilo: "不支持",
+  zcode: "不支持",
+  gemini: "不支持",
+  cline: "无签到",
+};
 const noCheckinText = (g) => NO_CHECKIN_TAG[g] || "无签到";
-// 无积分概念的渠道：积分区域显示「不适用」，并隐藏刷新积分/明细入口。
-// 当前所有渠道都有积分概念，故为空集；机制保留以备将来接入匿名通道。
-const NO_CREDITS = new Set();
+// 无积分概念的渠道（匿名通道）：积分区域显示「不适用」，并隐藏刷新积分/明细入口。
+// 内建名单只有 oczen/kilo/cline；自定义渠道（R66）同样无积分，但渠道名是用户配置的、
+// 运行期可增删，故运行时以后端下发的 custom_channels 动态判定（isCustomGroup）。
+const NO_CREDITS_BUILTIN = new Set(["oczen", "kilo", "cline"]);
+// 支持跳转登录编排的渠道：登录态失效时卡片显示 ⟳ 重新登录入口（#134）。
+// officeace 一并纳入（2026-10-17）：它除了「登录态失效」，还有「缺 refresh_token」
+// 这种**不能自愈**的形态（客户端导入只拿得到不过期的网关 Basic），此时同样只能重新登录
+// 才能恢复积分/签到 —— 徽标与 ⟳ 入口由同一处逻辑驱动（见 renderAccounts 的 needRelogin）。
+const RELOGIN_CHANNELS = new Set(["workbuddy", "workbuddyai", "traework", "qoder", "qodercn", "qodercom", "qwenwork", "raccoon", "officeace"]);
 
 // creditsText 账号卡片的积分文案。
 // 拆成「可用 / 不可用 / 临期」三个数字：渠道（如 TraeWork）会下发官方客户端专用的
@@ -422,12 +915,33 @@ const NO_CREDITS = new Set();
 // 不可用仅在 >0 时显示；临期同理，凭空多个灰/红 0 很吵。
 // 旧版本 state 文件（v2.2.0 及之前，无 unusable 字段）读入后 credits_stale=true，
 // 此时不把旧值当真值，改显示「待刷新」；自动刷新首刷成功后即变回真实拆分。
+// fmtTokens Token 数格式化：这类数字动辄上亿，直接铺开会撑破卡片与汇总条，
+// 故用中文紧凑单位（万/亿）显示；完整语义靠 title 说明。
+function fmtTokens(n) {
+  n = Number(n) || 0;
+  const trim = (s) => s.replace(/\.?0+$/, "");
+  if (Math.abs(n) >= 1e8) return trim((n / 1e8).toFixed(2)) + "亿";
+  if (Math.abs(n) >= 1e4) return trim((n / 1e4).toFixed(2)) + "万";
+  return n.toLocaleString("zh-CN");
+}
+
 function creditsText(a) {
   if (a.credits_na) {
-    return `<span class="credit-na" title="匿名通道无积分概念">不适用</span>`;
+    return `<span class="credit-na" title="该渠道无积分概念">不适用</span>`;
   }
   if (a.credits_stale) {
     return `<span class="credit-stale" title="余额口径已过期（旧版本状态文件），正在自动刷新…">待刷新</span>`;
+  }
+  // Token 计量渠道（credits_unit="token"，如 ZCode）：同一位置改显示 **Token 计数**。
+  // 与积分分开统计——它**不进**积分汇总合计（见 renderSummary），
+  // 但保留临期角标（token 桶同样有到期时间，来自内部 ResourceItem.ExpireAt）。
+  if (a.credits_unit === "token") {
+    let html = `<span class="credit-num">${fmtTokens(a.credits)}</span>`
+      + `<span title="本渠道额度以 token 计量，与积分分开统计">tokens</span>`;
+    if ((a.expiring_credits || 0) > 0) {
+      html += `<span class="credit-expiring"> (临期${fmtTokens(a.expiring_credits)})</span>`;
+    }
+    return html;
   }
   let html = `<span class="credit-num">${a.credits}</span><span>可用积分</span>`;
   if ((a.expiring_credits || 0) > 0) {
@@ -439,8 +953,11 @@ function creditsText(a) {
   return html;
 }
 
-// 渠道汇总固定顺序（与添加按钮布局一致；traecode 是别名池不单独出现，qoder 下线仅存量兜底）
-const CH_SUMMARY_ORDER = ["workbuddy", "workbuddyai", "traework", "qodercn", "qodercom", "qwenwork", "glm", "qoder"];
+// 渠道汇总固定顺序：与后端 feeChannelOrder（internal/app/app.go）同序，
+// 保持「账号卡片 → 汇总条 → 费率 tab」三处看到同一个渠道顺序。
+// ⚠️ 新增渠道必须同步此表：漏项会被 renderSummary 按字母序垫到最末
+//   （ui-static-check 有覆盖度断言）。qoder 已下线，仅为存量账号兜底留位。
+const CH_SUMMARY_ORDER = ["oczen", "kilo", "workbuddy", "workbuddyai", "qodercn", "qodercom", "traework", "traecode", "qwenwork", "glm", "cline", "monkeycode", "raccoon", "loomy", "minimax", "lobsterai", "zcode", "gemini", "codearts", "officeace", "qoder"];
 
 // renderSummary 渠道积分汇总条：每渠道一行「可用总积分 / 临期」，末尾合计。
 // 数据全部来自 state.accounts（pool 实时值），与账号卡片同源；
@@ -455,9 +972,11 @@ function renderSummary() {
   for (const a of state.accounts) {
     const g = a.group || "workbuddy";
     let c = byCh[g];
-    if (!c) { c = byCh[g] = { n: 0, credits: 0, expiring: 0, unusable: 0, stale: 0, na: false }; }
+    if (!c) { c = byCh[g] = { n: 0, credits: 0, expiring: 0, unusable: 0, stale: 0, na: false, isToken: false, tokens: 0 }; }
     c.n++;
     if (a.credits_na) { c.na = true; continue; }
+    // Token 计量渠道单列：只累加 token 数，**不并入**积分合计（与积分分开统计）。
+    if (a.credits_unit === "token") { c.isToken = true; c.tokens += a.credits || 0; c.expiring += a.expiring_credits || 0; continue; }
     c.credits += a.credits || 0;
     c.expiring += a.expiring_credits || 0;
     c.unusable += a.unusable_credits || 0;
@@ -466,8 +985,14 @@ function renderSummary() {
 
   const fmt = (n) => n.toLocaleString("zh-CN");
   // 已知渠道按固定顺序，未知渠道（新增时）按字母序垫后，保证不丢行
-  const chs = CH_SUMMARY_ORDER.filter((k) => byCh[k])
+  let chs = CH_SUMMARY_ORDER.filter((k) => byCh[k])
     .concat(Object.keys(byCh).filter((k) => !CH_SUMMARY_ORDER.includes(k)).sort());
+  // 「不适用」渠道（无积分概念：oczen/kilo/cline/自定义渠道）默认不进汇总条：
+  // 它们的 chip 只有一句「不适用」，既不反映余额也不参与合计，纯噪声。
+  // 收起时改由末尾一枚开关 chip 汇总提示（点它原地展开），账号卡片同步收起。
+  const naChs = chs.filter((k) => byCh[k].na);
+  const naAccts = naChs.reduce((n, k) => n + byCh[k].n, 0);
+  if (!showNoCredit) chs = chs.filter((k) => !byCh[k].na);
 
   let total = 0, totalExp = 0, staleChs = 0;
   let html = `<span class="cs-title">积分汇总</span>`;
@@ -476,11 +1001,17 @@ function renderSummary() {
     const allStale = c.stale === c.n;
     // R17 口径：口径过期的数字不当真值——全渠道待刷新时不进合计
     // （否则"待刷新"的旧值会悄悄抬高合计，用户看到的数字无从解释）。
-    if (!c.na && !allStale) { total += c.credits; totalExp += c.expiring; }
-    if (!c.na && allStale) staleChs++;
+    // Token 计量渠道不进积分合计（这就是「和积分分开统计」的落点）。
+    if (!c.na && !c.isToken && !allStale) { total += c.credits; totalExp += c.expiring; }
+    if (!c.na && !c.isToken && allStale) staleChs++;
     let body;
     if (c.na) {
       body = `<span class="credit-na">不适用</span>`;
+    } else if (c.isToken) {
+      // Token 计数：以 tokens 为单位单列，明示它不是积分。
+      body = `<span class="cs-num">${fmtTokens(c.tokens)}</span>`
+        + `<span class="cs-tok" title="本渠道额度以 token 计量，不计入「合计」">tokens</span>`
+        + (c.expiring > 0 ? `<span class="cs-exp" title="24 小时内到期">临期${fmtTokens(c.expiring)}</span>` : "");
     } else if (allStale) {
       body = `<span class="credit-stale">待刷新</span>`;
     } else {
@@ -491,7 +1022,7 @@ function renderSummary() {
     }
     const on = acctFilter === k ? " on" : "";
     html += `<span class="cs-chip clickable${on}" data-wg="${esc(k)}" role="button" tabindex="0"`
-      + ` title="点击筛选该渠道账号，再次点击取消"><span class="badge ${chClass(k)}">${esc(chLabel(k))}</span>`
+      + ` title="点击筛选该渠道账号，再次点击取消">${chBadge(k)}`
       + `<span class="cs-n">${c.n}号</span>${body}</span>`;
   }
   // 「全部」重置项：仅在有筛选时出现，点击清除筛选。整条不参与合计，故放在合计 chip 之前。
@@ -499,7 +1030,19 @@ function renderSummary() {
     html += `<span class="cs-chip clickable cs-all" data-wg="" role="button" tabindex="0" title="显示全部账号">`
       + `<span class="cs-n">全部</span></span>`;
   }
-  html += `<span class="cs-chip cs-total" title="各渠道可用积分合计（不含「不可用」与匿名通道）">`
+  // 「不适用」开关：默认收起（只留这一枚），展开后上面会重新出现这些渠道的 chip。
+  // 入口刻意放在被隐藏 chip 的原位，不额外占工具栏一格（R103）。
+  if (naChs.length) {
+    const names = naChs.map(chLabel).join("、");
+    const naTitle = showNoCredit
+      ? `收起「不适用」渠道（${names}）及其账号卡片`
+      : `展开「不适用」渠道（${names}）：这些渠道无积分概念，余额恒为「不适用」`;
+    html += `<span class="cs-chip clickable cs-na${showNoCredit ? " on" : ""}" data-na-toggle="1"`
+      + ` role="button" tabindex="0" title="${esc(naTitle)}">`
+      + `<span class="cs-n">不适用</span><span class="cs-num">${naAccts}号</span>`
+      + `<span class="cs-n">${showNoCredit ? "收起" : "展开"}</span></span>`;
+  }
+  html += `<span class="cs-chip cs-total" title="各渠道可用积分合计（不含「不可用」、匿名通道与 Token 计量渠道）">`
     + `<span class="cs-title">合计</span><span class="cs-num">${fmt(total)}</span>`
     + (totalExp > 0 ? `<span class="cs-exp">临期${fmt(totalExp)}</span>` : "")
     + (staleChs > 0 ? `<span class="cs-stale" title="有渠道整体待刷新，未计入合计">${staleChs} 渠道待刷新</span>` : "")
@@ -511,22 +1054,68 @@ function renderSummary() {
 // 汇总条 chip 与账号卡片同源于 state.accounts，点某个渠道 chip 即筛选其账号卡片。
 let acctFilter = null;
 
+// showNoCredit 「不适用」账号（无积分概念的渠道：oczen/kilo/cline/自定义渠道）是否展开。
+// **默认收起**：这些卡片永远只有一句「不适用」，却各占一整张卡片位置、汇总条上还各占一枚
+// chip，页面上真正有余额的渠道反被稀释（2026-10-19 用户要求「不适用的默认隐藏掉，
+// 但有时候又得看一下」）。开关放在汇总条末尾的「不适用 N号」chip 上——被隐藏的正是那几枚
+// chip，展开入口就在原地，不额外占工具栏。选择持久化到 localStorage，刷新不弹回默认。
+const SHOW_NA_KEY = "acct-show-na";
+let showNoCredit = false;
+try { showNoCredit = localStorage.getItem(SHOW_NA_KEY) === "1"; } catch (e) { /* 存储不可用时保持默认收起 */ }
+function persistShowNoCredit() {
+  try { localStorage.setItem(SHOW_NA_KEY, showNoCredit ? "1" : "0"); } catch (e) { /* 忽略 */ }
+}
+// isNoCreditAcct 该账号是否「无积分概念」：以后端下发的 credits_na 为准（与汇总条同口径，
+// 含 R66 的自定义渠道动态判定），不在前端另维护一份渠道名单。
+const isNoCreditAcct = (a) => Boolean(a && a.credits_na);
+
+// toggleNoCredit 展开/收起「不适用」渠道与账号卡片。
+function toggleNoCredit() {
+  showNoCredit = !showNoCredit;
+  persistShowNoCredit();
+  // 收起时若正筛选着某个「不适用」渠道，必须先清筛选：否则筛选态指向已隐藏的渠道，
+  // 网格一片空白，而用来取消筛选的「全部」chip 也随汇总条一起消失了。
+  if (!showNoCredit && acctFilter
+      && (state.accounts || []).some((a) => isNoCreditAcct(a) && (a.group || "workbuddy") === acctFilter)) {
+    acctFilter = null;
+  }
+  // 重渲染账号卡片而不只改 class：hidden 的直接来源是 renderAccounts 里的 naHiddenClass，
+  // 只靠 applyAcctFilter 改 class 时，任何一次 render() 都会把收起态“覆盖回去”（两处各写一份
+  // 可见性就是漂移源）。重渲染卡片的代价很小，换来单一真相。
+  renderSummary();
+  renderAccounts();
+  applyAcctFilter();
+}
+
 // applyAcctFilter 按 acctFilter 显示/隐藏账号卡片（与汇总条 chip 联动）。
-// 逐张卡片读徽章的渠道类名反查（卡片本身不带 data-group，避免改动 renderAccounts 的既有结构）。
+// 逐张卡片读 data-group（由 renderAccounts 写入的**渠道 key**，不是 CSS 短类名）：
+//   自定义渠道的短类名一律是 custom，拿类名反查会把它们全归到同一个 key 上，
+//   而“点某渠道 chip 只留该渠道”本来就不能靠类名区分（R99）。
 function applyAcctFilter() {
   const grid = $("acctList");
   if (!grid) return;
+  let shown = 0;
   grid.querySelectorAll(".acct-card").forEach((card) => {
-    const badge = card.querySelector(".acct-top .badge");
-    const key = badge ? (CLS_KIND[badge.classList[1]] || "") : "";
-    const show = !acctFilter || key === acctFilter;
+    const key = card.dataset.group || "";
+    // 两道独立过滤，取「与」：① 渠道 chip 筛选；② 收起「不适用」账号。
+    // 必须同时判——筛选到某渠道时也不该把它被收起的「不适用」账号漏出来。
+    const naHidden = !showNoCredit && card.dataset.na === "1";
+    const show = !naHidden && (!acctFilter || key === acctFilter);
     card.classList.toggle("hidden", !show);
+    if (show) shown++;
   });
+  // 全部卡片都被收起时给出可执行的提示：留一片空白会被当成「账号丢了」。
+  const tip = $("acctHiddenTip");
+  if (tip) {
+    const total = grid.querySelectorAll(".acct-card").length;
+    const naTotal = grid.querySelectorAll('.acct-card[data-na="1"]').length;
+    const hide = total > 0 && shown === 0 && naTotal > 0;
+    tip.classList.toggle("hidden", !hide);
+    if (hide) {
+      tip.textContent = `已收起 ${naTotal} 个「不适用」账号（无积分概念的渠道）· 点汇总条末尾的「不适用」展开`;
+    }
+  }
 }
-
-// CLS_KIND 徽章 CSS 短类名 → 渠道 key 的反查表（与 CH_CLASS 互逆）。
-const CLS_KIND = {};
-for (const k of Object.keys(CH_CLASS)) CLS_KIND[CH_CLASS[k]] = k;
 
 // setAcctFilter 设置筛选并同步汇总条高亮与账号卡片可见性。
 function setAcctFilter(kind) {
@@ -540,6 +1129,8 @@ function bindSummaryFilter() {
   const el = $("creditSummary");
   if (!el) return;
   const pick = (target) => {
+    // 「不适用」开关走独立分支：它不是渠道筛选（没有 data-wg），点了要展开/收起整组。
+    if (target.closest("[data-na-toggle]")) { toggleNoCredit(); return; }
     const chip = target.closest(".cs-chip.clickable");
     if (!chip) return;
     setAcctFilter(chip.dataset.wg || null);
@@ -564,12 +1155,10 @@ function renderAccounts() {
   const gained = creditDelta();
 
   grid.innerHTML = state.accounts.map((a) => {
-    const group = chClass(a.group);
-    const groupName = chLabel(a.group);
     const noCheckin = noExplicitCheckin(a.group); // 无显式签到，签到按钮灰掉
     const noCheckinTitle = a.group === "workbuddyai"
       ? "无需手动签到：定时自动对话保活并领取日活奖励"
-      : `${groupName} 不支持手动签到`;
+      : `${chLabel(a.group)} 不支持手动签到`;
 
     const checkinTag = a.last_checkin_at
       ? `<span class="tag ${a.last_checkin_ok ? "ok" : "bad"}">${a.last_checkin_ok ? "签到成功" : "签到失败"}</span>`
@@ -580,35 +1169,76 @@ function renderAccounts() {
     const disableTitle = a.disabled ? "启用" : "停用";
 
     // 冷却标签（后端 pool.Status 已透出 cooling/until/reason，此前前端未渲染）。
-    // 为什么需要：账号被冷却时挑号会跳过它，表现为「积分明明很多却报 503/上游限流」，
+    // 为什么需要：账号被冷却时挑号会跳过它，表现为「积分明明很多却报 503/上游限流」,
     // 而卡片上毫无提示——用户只能靠猜。这里把「冷却到几点 + 原因」直接摆出来。
-    // until 由后端 fmtTime 预格式化为 "01-02 15:04"，为空则退化为「冷却中」。
+    // until 由后端 fmtTime 预格式化为 "01-02 15:04"（24h 制），为空则退化为「冷却中」。
+    // 24h 制歧义修复（如 10-18 07:07 是次日清晨，却极易被读成「19 点显示成 7 点」）：
+    // 后端同时透出 until_ts，这里实时算出「剩 X 时 X 分」并列展示，绝对时刻 +
+    // 相对时长双保险，跨零点不再误读；无 until_ts（旧后端）时退回纯文案，不破兼容。
     const coolingTag = a.cooling
-      ? `<span class="tag warn" title="${esc(a.reason || "冷却中")}">冷却至 ${esc(a.until || "-")}</span>`
+      ? `<span class="tag warn" title="${esc(a.reason || "冷却中")}">冷却至 ${esc(a.until || "-")}${a.until_ts ? `<span data-until-ts="${a.until_ts}">（${fmtLeft(a.until_ts)}）</span>` : ""}</span>`
       : "";
     const coolingClass = a.cooling ? " cooling" : "";
     const checkinBtn = noCheckin
       ? `<span class="icon-op off" title="${esc(noCheckinTitle)}" onclick="return false">✓</span>`
       : `<span class="icon-op" title="签到" onclick="checkin('${a.uid}')">✓</span>`;
 
-    // 匿名渠道（无积分/无签到）：只保留「不可操作」的静态指示，
-    // 不给刷新积分/停用/删除入口——后端也会硬拒，避免用户白点一次。
-    const noCredits = NO_CREDITS.has(a.group);
-    // 成长任务入口：仅成长中心支持的渠道显示（目前只有 WorkBuddy 国内版）。
-    // 用后端下发的 a.growth 判定，不在前端硬编码渠道名。
-    const taskBtn = a.growth
-      ? `<span class="icon-op" title="执行成长任务（会真实改变账号状态）" onclick="runTasks('${a.uid}')">★</span>`
+    // 无积分账号分两类，处理不同：
+    // - oczen/cline（固定账号）：只保留「不可操作」的静态指示，
+    //   不给刷新积分/停用/删除入口——后端也会硬拒，避免用户白点一次。
+    // - 自定义渠道（R66）：无积分/无签到，但账号可在设置里停用/删除，
+    //   故保留停用/删除/改名入口，只去掉签到/刷新积分两个无意义按钮。
+    // 判定优先用后端下发的 credits_na（单一真相），前端名单只作旧载荷的兜底。
+    const noCredits = isNoCreditAcct(a) || hasNoCredits(a.group);
+    const fixedAcct = noCredits && !isCustomGroup(a.group);
+    // 默认收起的「不适用」卡片：渲染时就带上 hidden（而不是等 applyAcctFilter），
+    // 首帧不会先闪一排「不适用」再消失；applyAcctFilter 后续负责保持同步。
+    const naHiddenClass = (!showNoCredit && isNoCreditAcct(a)) ? " hidden" : "";
+    // 问号图标：hover 展示 oczen 通道说明（免费反代范围/私有 Key/代理三项）。
+    // 放在锁头左侧；用独立的 help 样式（正常亮度 + help 光标），不可点击但 tooltip 可用。
+    // title 内换行用 &#10;（HTML 属性实体），字面 \n 会被部分浏览器吞掉导致无 tooltip。
+    const oczenHelp = `<span class="icon-op help" title="关于 OpenCodeZen 通道：&#10;1. 本工具仅反代其免费模型（绕过官方客户端限制）；付费账号可直接使用官方端点，无需经此通道&#10;2. 在 OpenCodeZen 获取的 API-Key 可在设置中配置，避免匿名账号共享限额超限&#10;3. 地域受限的免费模型（如 muse-spark 系）会经「备用上游通道」自动重发（设置里配置代理地址；未配置则原文透传 403）">?</span>`;
+    // kilo 的说明与 oczen 不同：没有私有 Key 可配，也没有备用通道重放。
+    const kiloHelp = `<span class="icon-op help" title="关于 Kilo 免费池：&#10;1. 上游是 api.kilo.ai 网关的免费模型池，**不需要任何凭据**（无账号、无 Key）&#10;2. 只反代免费池（模型清单里 isFree=true 的那些）；请求付费模型会返回 PAID_MODEL_AUTH_REQUIRED&#10;3. 无签到、无积分，故没有「刷新积分」入口">?</span>`;
+    const channelHelp = a.group === "kilo" ? kiloHelp : oczenHelp;
+    // 登录态失效（401/登录已失效）：徽标 + 一键重新登录（#134）。
+    const sessionDeadTag = a.session_dead
+      ? `<span class="tag bad" title="${esc(a.session_dead_reason || "登录态已失效，请重新登录")}">需重新登录</span>`
       : "";
-    const ops = noCredits
-      ? `<span class="icon-op off" title="固定账号，不可停用/删除" onclick="return false">🔒</span>`
+    // 凭据缺 refresh_token（目前只有 OfficeAce，见后端 refreshTokenMissing）：
+    // 性质与「登录态失效」不同 —— 不是被上游拒了，而是本地根本没这条凭据，
+    // **不会自愈**，所以徽标要**持久**显示（原先只在导入那一刻弹一次提示，事后无从复查）。
+    // 用 warn 色与 bad 区分：前者「还能对话，但积分/签到不可用」，后者「登录已失效」。
+    const missingRT = Boolean(a.refresh_token_missing);
+    const missingRTTag = missingRT
+      ? `<span class="tag warn" title="${esc(a.refresh_token_missing_reason || "凭据缺 refresh_token：积分/签到不可用，需重新登录或重新导入")}">缺续期凭据</span>`
+      : "";
+    const needRelogin = Boolean(a.session_dead) || missingRT;
+    const reloginTitle = missingRT
+      ? "重新登录（本账号缺 refresh_token，积分/签到不可用；登录成功后自动补签）"
+      : "重新登录（跳转登录页换新凭据，成功后自动补签）";
+    // 一键重新登录：沿用既有内联 onclick 形态（本仓无 CSP 头，全文件已有 10 处同款写法）。
+    // 渠道差异由 `startLogin` 内部**分派**：OfficeAce 是「华为云授权码 + 云端轮询捕获」的
+    // 两步流程，必须走 startOfficeAceWebLogin（→ POST /api/login/officeace_auto），不能走
+    // 一次性的 POST /api/login/start。2026-10-18 修正：先前 OfficeAce 的 ⟳ 直接打
+    // /api/login/start，而后端 StartLoginFor 未登记 officeace ⇒ 点了只弹
+    // `unknown login provider officeace`（死按钮，独立复核抓出）。
+    const reloginBtn = needRelogin && RELOGIN_CHANNELS.has(a.group)
+      ? `<span class="icon-op" title="${reloginTitle}" onclick="startLogin('${a.group}')">⟳</span>`
+      : "";
+    const ops = fixedAcct
+      ? `${channelHelp}<span class="icon-op off" title="固定账号，不可停用/删除" onclick="return false">🔒</span>`
       : `${checkinBtn}
-          ${taskBtn}
-          <span class="icon-op" title="刷新积分" onclick="refreshOne('${a.uid}')">↻</span>
+          ${reloginBtn}
+          ${noCredits ? "" : `<span class="icon-op" title="刷新积分" onclick="refreshOne('${a.uid}')">↻</span>`}
           <span class="icon-op warn" title="${disableTitle}" onclick="toggleDisable('${a.uid}',${a.disabled})">${disableIcon}</span>
-          <span class="icon-op danger" title="删除账号" onclick="removeAcct('${a.uid}')">✕</span>`;
-    // 显示名：点击直接弹出改名框（无积分渠道降级为普通文本）。
-    const nameHtml = noCredits
-      ? `<span class="acct-name">${esc(a.nickname || shortUid(a.uid))}</span>`
+          <span class="icon-op danger" title="${isCustomGroup(a.group) ? esc("删除账号（自定义渠道将移除整个渠道配置）") : "删除账号"}" onclick="removeAcct('${a.uid}')">✕</span>`;
+    // 显示名：点击直接弹出改名框（匿名渠道不可改，降级为普通文本）。
+    // oczen 特例：渠道名已由 badge 承担，名字按凭证形态显示「匿名/私有Key」。
+    const isOczen = a.group === "oczen";
+    const oczenName = (state.oczen_api_key || "") ? "私有Key" : "匿名";
+    const nameHtml = fixedAcct
+      ? `<span class="acct-name">${esc(isOczen ? oczenName : (a.nickname || shortUid(a.uid)))}</span>`
       : `<span class="acct-name editable" title="点击修改显示名" onclick="openRename('${a.uid}','${esc(a.nickname || shortUid(a.uid)).replace(/'/g, "&#39;")}')">${esc(a.nickname || shortUid(a.uid))}</span>`;
 
     // 「调用中 / 最近用过」徽标。HTML 由 liveTagHtml 统一生成，
@@ -619,10 +1249,10 @@ function renderAccounts() {
     const liveTag = `<span class="acct-live-slot">${liveTagHtml(a)}</span>`;
 
     return `
-    <div class="acct-card${disabledClass}${coolingClass}${a.in_use ? " in-use" : ""}" data-uid="${esc(a.uid)}">
+    <div class="acct-card${disabledClass}${coolingClass}${naHiddenClass}" data-group="${esc(a.group || "workbuddy")}" data-na="${isNoCreditAcct(a) ? 1 : 0}">
       <div class="acct-top">
         <div>
-          <span class="badge ${group}">${groupName}</span>
+          ${chBadge(a.group)}
           ${nameHtml}
           ${liveTag}
         </div>
@@ -632,8 +1262,8 @@ function renderAccounts() {
       </div>
       <div class="acct-uid">UID: ${esc(shortUid(a.uid))}</div>
       <div class="acct-mid">
-        <div class="acct-credits"${noCredits ? "" : ` onmouseenter="showCreditDetail(event,'${a.uid}')" onmouseleave="hideCreditDetail()"`}>${creditsText(a)}</div>
-        <div class="acct-checkin">${gained[a.uid] ? `<span class="tag ok" title="本轮任务带来的积分增量">+${gained[a.uid]}</span>` : ""}${coolingTag}${checkinTag}</div>
+        <div class="acct-credits${noCredits ? "" : " clickable"}" data-uid="${a.uid}"${noCredits ? "" : ` onclick="showCreditDetail(event,'${a.uid}')" title="点击查看积分明细（含分页）" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showCreditDetail(event,'${a.uid}')}"`}>${creditsText(a)}</div>
+        <div class="acct-checkin">${coolingTag}${sessionDeadTag}${missingRTTag}${checkinTag}</div>
       </div>
     </div>`;
   }).join("");
@@ -646,18 +1276,39 @@ function renderTimes() {
   $("nextCheckin").textContent = state.next_checkin || "-";
 }
 
-// channelCredits 汇总某渠道全部账号的可用积分（与积分汇总条同源 state.accounts）。
-// 无该渠道账号时返回 null（前端不渲染角标，避免显示误导性的 0）。
+// channelCredits 汇总某渠道全部账号的可用额度（与积分汇总条同源 state.accounts）。
+//
+// 返回 { bal, unit }：unit 为 ""（积分）或 "token"（Token 计数，如 ZCode）。
+// ⚠️ 调用方**必须**按 unit 选单位与格式化（token 用 fmtTokens、积分用 fmtNum）——
+// 否则会把上亿 token 显示成「N 分」（2026-10-17 用户截图报告：费率页 ZCode 角标
+// 显示「余额 8,000,000 分」，正是漏了这一步）。
+// 无该渠道账号时返回 null（不渲染角标，避免显示误导性的 0）。
 function channelCredits(kind) {
   if (!state || !state.accounts) return null;
-  let sum = 0, has = false;
+  let sum = 0, has = false, unit = "";
   for (const a of state.accounts) {
     if ((a.group || "workbuddy") !== kind) continue;
-    if (a.credits_na) return null; // 匿名渠道无积分概念
+    if (a.credits_na) return null; // 匿名渠道无额度概念
     has = true;
+    if (a.credits_unit === "token") unit = "token";
     sum += a.credits || 0;
   }
-  return has ? sum : null;
+  return has ? { bal: sum, unit } : null;
+}
+
+// tabBalText 渠道 tab 余额角标文案（按计量单位切换：token 与积分分开显示）。
+function tabBalText(v) {
+  if (!v) return "";
+  return v.unit === "token"
+    ? `余额 ${fmtTokens(v.bal)} tokens`
+    : `余额 ${fmtNum(v.bal)} 分`;
+}
+
+// tabBalTitle 角标 tooltip：明示单位与统计口径（token 不计入积分合计）。
+function tabBalTitle(v) {
+  return v && v.unit === "token"
+    ? "该渠道全部账号当前可用 Token 数（与积分分开统计，不计入积分合计）"
+    : "该渠道全部账号当前可用积分合计";
 }
 
 // fmtNum 千分位整数（与汇总条的 fmt 同口径，独立命名避免作用域冲突）。
@@ -679,9 +1330,13 @@ function refreshTabBalances() {
       if (el) el.remove();
       return;
     }
-    const txt = `余额 ${fmtNum(bal)} 分`;
-    if (el) { if (el.textContent !== txt) el.textContent = txt; }
-    else { const s = document.createElement("span"); s.className = "fees-tab-bal"; s.textContent = txt; s.title = "该渠道全部账号当前可用积分合计"; tab.appendChild(s); }
+    const txt = tabBalText(bal);
+    const tip = tabBalTitle(bal);
+    if (el) {
+      if (el.textContent !== txt) el.textContent = txt;
+      if (el.title !== tip) el.title = tip;
+    }
+    else { const s = document.createElement("span"); s.className = "fees-tab-bal"; s.textContent = txt; s.title = tip; tab.appendChild(s); }
   });
 }
 
@@ -720,16 +1375,28 @@ function renderFees(fees) {
     return caps.length > 0 ? ` <span class="cap-icons">${caps.join("")}</span>` : "";
   };
 
+  // 思考档位标记（issue #96）：模型 ID 后的档位小字标，如 [low·high·max]。
+  // 只在上游目录声明时展示（reasoning_efforts 非空），不自行编造。
+  const effortTag = (m) => {
+    if (!m || !m.reasoning_efforts || !m.reasoning_efforts.length) return "";
+    const list = m.reasoning_efforts.join("·") + (m.default_reasoning_effort ? `（默认 ${m.default_reasoning_effort}）` : "");
+    return ` <span class="effort-tag" title="思考档位（上游目录声明）：${esc(list)}；客户端传 reasoning_effort 即可调档">[${esc(m.reasoning_efforts.join("·"))}]</span>`;
+  };
+
   // 上下文标记：模型 ID 后的 (1M)/(180K) 小字标。
-  // 只在上游接口真实返回时展示（has_context），不拿估算值充数。
+  // has_context = 上游接口真实返回（context_from_api）或本工具手工实测（hand_measured）。
+  // 实测值用带 * 的写法「(1M*)」+ tooltip 标注来源——不把实测冒充成上游官方值，
+  // 同时也不埋没它（cline 这类渠道上游根本不返回上下文，只能靠实测）。
   const ctxTag = (m) => {
     if (!m || !m.has_context || !m.context_window) return "";
-    return ` <span class="ctx-tag" title="上下文窗口：${fmtTokens(m.context_window)} tokens">(${fmtTokens(m.context_window)})</span>`;
+    const hand = m.hand_measured ? "*" : "";
+    const src = m.hand_measured ? "本工具实测值（仅供参考，非上游官方声明）" : "上游接口返回";
+    return ` <span class="ctx-tag${m.hand_measured ? " hand" : ""}" title="上下文窗口：${fmtTokensCompact(m.context_window)} tokens（${src}）">(${fmtTokensCompact(m.context_window)}${hand})</span>`;
   };
 
   // 能力文字摘要，拼进模型 tooltip。
   // 措辞说明：上游模型列表接口未声明某能力时，本工具不自行断言其「不支持」，
-  // 只说「未声明」——避免把缺失信息当成否定结论。
+  // 只说「未声明」；hand_measured（本工具实测）时改说「实测不支持」，如实标出来源。
   const capText = (m) => {
     if (!m) return null;
     const yes = [], unknown = [];
@@ -737,7 +1404,11 @@ function renderFees(fees) {
     (m.supports_reasoning ? yes : unknown).push("思考模式");
     const parts = [];
     if (yes.length) parts.push(`支持：${yes.join("、")}`);
-    if (unknown.length) parts.push(`上游未声明：${unknown.join("、")}`);
+    if (unknown.length) parts.push(`${m.hand_measured ? "实测不支持" : "上游未声明"}：${unknown.join("、")}`);
+    if (m.reasoning_efforts && m.reasoning_efforts.length) {
+      parts.push(`思考档位：${m.reasoning_efforts.join("/")}${m.default_reasoning_effort ? `（默认 ${m.default_reasoning_effort}）` : ""}`);
+    }
+    if (m.hand_measured) parts.push("（能力与上下文为本工具实测值，仅供参考）");
     return parts.join("；");
   };
 
@@ -745,8 +1416,9 @@ function renderFees(fees) {
   const modelTip = (m) => {
     const parts = [`模型：${m.model}`];
     if (m.has_context && m.context_window) {
-      parts.push(`上下文窗口：${fmtTokens(m.context_window)}`);
-      if (m.max_tokens) parts.push(`最大输出：${fmtTokens(m.max_tokens)}`);
+      const src = m.hand_measured ? "（本工具实测，非上游官方值）" : "";
+      parts.push(`上下文窗口：${fmtTokensCompact(m.context_window)}${src}`);
+      if (m.max_tokens) parts.push(`最大输出：${fmtTokensCompact(m.max_tokens)}`);
     } else {
       parts.push("上下文窗口：未知");
       parts.push("最大输出：未知");
@@ -776,21 +1448,26 @@ function renderFees(fees) {
     return ` <span class="rate-note"${style}>${esc(m.note)}</span>`;
   };
 
-  // 模型标识单元格：模型名 + 上下文/能力/促销标记。
-  // 模型名可点击复制。复制内容 = **带倍率后缀**的完整标识（如
-  // `workbuddy/glm-5.3-flash (0.06x)`）—— 后端路由会剥掉后缀，所以粘到客户端
-  // 仍能正常请求，而用户在客户端里能看到「这个烧多少积分」。
-  // 无倍率（上游未返回定价）的模型复制裸名，不用 0 冒充。
-  // data-mid 存复制内容供事件委托读取；data-plain 存裸名（显示/tooltip 用）。
-  const modelIdCell = (m, kind) => {
+  // 模型单元格（二开，升级勿丢）：上方为模型名 + 能力/上下文标记，下方为完整模型 ID
+  // （含渠道前缀，即客户端添加模型时实际要填的模型名），点击一键复制到剪贴板。
+  // 模型名本身也可点击复制完整 ID（官方 v2.6.1 交互），两处 data-mid 语义一致。
+  // m.model 来自 /api/fees 是裸名（不带渠道前缀），完整 ID 需拼上 chPrefix（ch.channel）。
+  const modelCellHtml = (m, chPrefix) => {
     if (!m) return "";
-    const plain = `${kind}/${m.model}`;
-    // 有明确倍率才加后缀；free(0.00) 也要显示 —— 用户需要知道「这个免费」。
-    const copy = m.priced ? plain + ` (${m.rate.toFixed(2)}x)` : plain;
-    const copyTip = `点击复制：${copy}`;
-    const title = `${modelTip(m)}\n${copyTip}`;
-    return `<code class="fee-model-copy" data-mid="${esc(copy)}" data-plain="${esc(plain)}" role="button" tabindex="0" title="${esc(title)}">${esc(m.model)}</code>`
-      + `${ctxTag(m)}${capIcons(m)}${noteCell(m)}`;
+    const raw = m.model;
+    // 短名：去掉渠道前缀（`xxx/name` -> `name`），展示在上行的模型名位置
+    const short = raw.includes("/") ? raw.slice(raw.indexOf("/") + 1) : raw;
+    // 完整 ID 取服务端给的 m.id（同 /v1/models 口径）：普通渠道是 `<渠道>/<模型>`；
+    // 上游 ID 自带命名空间的渠道（cline-free/*）直接透传上游 ID（R59）。
+    // 缺字段时退回旧拼接（兼容旧后端）：仅当裸名已以渠道前缀开头时原样保留（防重复）。
+    const full = m.id || (chPrefix && !raw.startsWith(`${chPrefix}/`) ? `${chPrefix}/${raw}` : raw);
+    const copyTip = `点击复制：${full}`;
+    const line = `<div class="mline"><code class="fee-model-copy" data-mid="${esc(full)}" role="button" tabindex="0" title="${esc(modelTip(m))}\n${copyTip}">${esc(short)}</code>${ctxTag(m)}${effortTag(m)}${capIcons(m)}${noteCell(m)}</div>`;
+    // 仅当完整ID != 短名时才显示可复制的完整 ID 行，避免裸名模型重复
+    const idRow = full !== short
+      ? `<span class="full-id" data-mid="${esc(full)}" title="点击复制完整模型 ID：${esc(full)}">${esc(full)}</span>`
+      : "";
+    return `<div class="mcell">${line}${idRow}</div>`;
   };
 
   // 渠道多标签：每个渠道一个 tab，panel 内双列模型布局不变（issue：费率表太长）。
@@ -802,6 +1479,21 @@ function renderFees(fees) {
   }
   const active = renderFees.lastCh;
 
+  // 搜索态判定：**必须提到两个循环之外**。曾写在第一个 for 里，第二个循环的
+  // `if (!searching && unpriced > 0)` 直接 ReferenceError —— 只要任一渠道模型数为 0
+  // （无账号/拉取失败都会这样），整个费率 tab 就白屏，控制台只有一行不起眼的报错。
+  const searching = !!feeQuery();
+
+  // 工具行：模型搜索框 + 「显示隐藏模型」开关。
+  // 这两个控件曾在上游前端整体替换时连同绑定一起丢失（JS 里的引用还在，
+  // 但 DOM 与事件都没有 ⇒ 功能静默消失，静态检查的悬空 id 检测专门盯这个）。
+  // 渲染在 renderFees 内部（而非 index.html）：整个费率区都是这里生成的。
+  html += `<div class="fees-tools">
+    <input id="feeSearch" class="input" type="search" placeholder="搜索模型 / 渠道 / 完整 ID"
+           value="${esc(feeQuery())}" autocomplete="off">
+    <button id="btnShowAllModels" class="btn small" type="button"></button>
+  </div>`;
+
   html += `<div class="fees-tabs">`;
   for (const ch of channels) {
     // tab 上的数字必须与表里**实际行数**同口径，否则用户按数字核对会以为漏了模型。
@@ -811,39 +1503,25 @@ function renderFees(fees) {
     //   默认态  → 仅上游给了倍率的模型数
     // 早期版本搜索态仍显示默认态计数（搜出 2 行却标 20），看着像「模型清单不全」。
     const all = ch.models || [];
-    const searching = !!feeQuery();
     const n = searching
       ? all.filter((m) => m && feeMatch(ch.channel, m)).length
       : all.filter((m) => m && (m.priced || showAllModels())).length;
     const on = ch.channel === active ? " active" : "";
-    // 渠道积分余额角标：取自 state.accounts（与积分汇总条同源），
-    // 让用户在选择渠道时即可看到「这个渠道还有多少积分可用」。
+    // 渠道余额角标：取自 state.accounts（与积分汇总条同源），让用户在选择渠道时即可看到
+    // 「这个渠道还有多少可用」；单位随渠道计量单位切换（token / 积分，见 tabBalText）。
     const bal = channelCredits(ch.channel);
     const balHtml = bal === null ? ""
-      : `<span class="fees-tab-bal" title="该渠道全部账号当前可用积分合计">余额 ${fmtNum(bal)} 分</span>`;
+      : `<span class="fees-tab-bal" title="${esc(tabBalTitle(bal))}">${esc(tabBalText(bal))}</span>`;
     html += `<button class="fees-tab${on}" data-feech="${esc(ch.channel)}"
       title="${esc(chLabel(ch.channel))}">${esc(chLabel(ch.channel))}<span class="fees-tab-n">${n}</span>${balHtml}</button>`;
   }
   html += `</div>`;
 
   for (const ch of channels) {
-    const chCls = chClass(ch.channel);
-    const all = ch.models || [];
-    // 本表的用途是「比价」：没有倍率的模型（unknown）在这里没有信息量，
-    // 且多为上游的内部/子代理模型（browser_use_subagent、computer_use_subagent 等，
-    // 它们本就不按 token 计费，所以费率接口不返回）。
-    // 因此默认只渲染有倍率的行，隐藏数量在表下注明 —— 避免用户以为模型清单缺了东西：
-    // 接口与客户端看到的始终是完整清单（/v1/models 不受影响）。
-    // 「显示隐藏模型」开关打开后，这些模型一并显示（用户要的是**完整清单**，比如
-    // 确认某个子代理模型到底存不存在），此时不再需要隐藏说明。
-    //
-    // 搜索态无条件显示命中项：用户搜的就是具体模型，没倍率也该看到
-    // （并明确标注 unknown），否则搜了等于没搜。此时按钮不参与筛选 ——
-    // 搜索结果已是全部命中项，再叠加开关只会让用户以为按钮失灵。
-    const searching = !!feeQuery();
-    const models = searching ? all.filter((m) => m && feeMatch(ch.channel, m))
-                             : all.filter((m) => m && (m.priced || showAllModels()));
-    const unpriced = all.length - all.filter((m) => m && m.priced).length;
+    const models = ch.models || [];
+    // 本渠道「上游未给倍率」的模型数。曾整个变量缺失（只在注释里被引用），
+    // 一进费率 tab 就 ReferenceError 白屏；语义见下方两段 note 文案。
+    const unpriced = models.filter((m) => m && !m.priced).length;
     const hidden = ch.channel !== active ? ' class="hidden"' : '';
     html += `<div class="fees-panel${hidden ? ' hidden' : ''}" data-feepanel="${esc(ch.channel)}">`;
     if (models.length === 0) {
@@ -855,7 +1533,9 @@ function renderFees(fees) {
     for (let i = 0; i < models.length; i += 2) {
       const m1 = models[i];
       const m2 = models[i + 1];
-      html += `<tr><td>${modelIdCell(m1, ch.channel)}</td><td>${rateCell(m1)}</td><td>${modelIdCell(m2, ch.channel)}</td><td>${rateCell(m2)}</td></tr>`;
+      const id1 = modelCellHtml(m1, ch.channel);
+      const id2 = modelCellHtml(m2, ch.channel);
+      html += `<tr><td>${id1}</td><td>${rateCell(m1)}</td><td>${id2}</td><td>${rateCell(m2)}</td></tr>`;
     }
     html += `</tbody></table>`;
     if (!searching && unpriced > 0) {
@@ -971,10 +1651,21 @@ function applyFeeSearch() {
 function bindFeesTabs() {
   const box = $("feesBox");
   box.addEventListener("click", (e) => {
-    // 模型名点击复制优先判定：code.fee-model-copy 不是 .fees-tab，互不冲突。
+    // 「显示隐藏模型」开关（与搜索框同在工具行；renderFees 每次重建 DOM，
+    // 故这里必须用事件委托，不能一次性绑定）。
+    const sw = e.target.closest("#btnShowAllModels");
+    if (sw && box.contains(sw)) { toggleShowAllModels(); return; }
+    // 模型名点击复制（官方 v2.6.1）：code.fee-model-copy 优先判定，
+    // 与下方的 .full-id（二开完整 ID 行）互不冲突、语义一致。
     const code = e.target.closest("code.fee-model-copy");
     if (code && box.contains(code)) {
       copyText(code.dataset.mid, "模型名");
+      return;
+    }
+    // 完整模型 ID 一键复制（二开，升级勿丢）：点费率表每行模型下方的完整ID即复制
+    const cpid = e.target.closest && e.target.closest(".full-id");
+    if (cpid) {
+      copyText(cpid.dataset.mid || cpid.textContent, "模型 ID");
       return;
     }
     const btn = e.target.closest(".fees-tab");
@@ -993,10 +1684,28 @@ function bindFeesTabs() {
     const code = e.target.closest("code.fee-model-copy");
     if (code && box.contains(code)) { e.preventDefault(); copyText(code.dataset.mid, "模型名"); }
   });
+  // 搜索框：input 即过滤（委托，理由同上）。Esc 清空。
+  box.addEventListener("input", (e) => {
+    if (e.target && e.target.id === "feeSearch") applyFeeSearch();
+  });
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && e.target && e.target.id === "feeSearch") {
+      e.target.value = "";
+      applyFeeSearch();
+    }
+  });
 }
 
-// fmtTokens 把 token 数格式化为 1M / 192k 形式。
-function fmtTokens(n) {
+// fmtTokensCompact 把 token 数格式化为 1M / 192k 紧凑形式。
+//
+// ⚠️ 用途边界（2026-10-17 修「同名函数互相覆盖」后确立）：
+//   - 本函数（k/M）**只**用于「模型元数据」——上下文窗口、最大输出这类上游以
+//     k/M 口径描述的能力值，保持与官方文档一致（131072 -> 131k）。
+//   - **额度 / 用量数字**（账号卡片的 Token 计数、明细单元格、平台表）必须用
+//     `fmtTokens`（万/亿中文单位）—— 那些数字动辄上亿，`94539k` 用户读不出来。
+// 历史：本函数原名 `fmtTokens`，与后面新增的万/亿版**同名**，后者在前、本函数在后，
+// 于是本函数静默覆盖了它 ⇒ Token 卡片显示成 `94539k`。改名以消除覆盖。
+function fmtTokensCompact(n) {
   if (!n) return "-";
   if (n >= 1000000 && n % 1000000 === 0) return `${n / 1000000}M`;
   if (n >= 1000) return `${Math.round(n / 1000)}k`;
@@ -1004,13 +1713,54 @@ function fmtTokens(n) {
 }
 
 // ---------- 账号操作 ----------
+// 签到失败信息友好化：登录态失效形态（401 等）追加可操作指引（#134）。
+function friendlyCheckinMsg(m) {
+  return /401|unauthorized|登录已失效|登录已过期/i.test(m || "")
+    ? m + "（该账号登录已过期，点账号卡片右上角 ⟳ 重新登录）" : m;
+}
+// checkinToast 签到后的提示文案。
+// 为什么不能一律写「签到成功」：Qoder 双区的 campaigns 路径有三个**都是 ok=true** 的结果——
+// 真领到（msg「签到成功 +100」）/ 今日已领（msg「今日已领取 +100」）/ 上游还没发可领活动
+// （no_campaign，msg 是诊断摘要）。旧文案把第三种也说成「签到成功：上游未下发可领取活动…」，
+// 读起来像领到了，是 10-17「签到没实现」误判的来源之一。这里按 msg 区分，绝不越权声称。
+//
+// 第三档再分「失败」与「暂未领到」：后端在 ok=true 下也可能给出失败形态的 msg
+// （如「领取失败 http 400: …」「claim parse: …」），那是**真失败**，说成「暂未领到」
+// 等于换了说法的假成功。判据放在兜底分支之前，不给「先被 +N 命中」的机会。
+const CHECKIN_FAIL_RE = /失败|http \d{3}|error|无法解析|parse|未知状态|401|403|500/i;
+// 第五档「无领取资格」（2026-10-18 用户实测定性）：该活动由**上游按账号授予资格**，
+// 不是每个号都有；没资格的号在官方客户端里同样看不到入口。后端会直说「该账号无积分
+// 领取活动资格……不是本工具的问题，重试无意义」。
+// 为什么必须单独成档：这条 msg 既不含「失败」也不含错误码，会落到兜底分支被说成
+// 「暂未领到」，再叠加下面那句「窗口内会自动重试」——对一个永远不会有结果的账号，
+// 等于让用户一直等一个不会发生的事。这正是「以为工具没实现」的最后一处来源。
+const CHECKIN_NO_ELIGIBILITY_RE = /无积分领取活动资格|无领取资格/;
+function checkinToast(r) {
+  const msg = r.msg || "";
+  if (!r.ok) return `签到：${friendlyCheckinMsg(msg)}`;
+  if (/^今日已领取/.test(msg)) return `今日已领过：${msg}（剩余 ${r.remain}）`;
+  // 注意「领取失败 http 400」里也可能带数字，故失败判据必须先于「含 +N」判据。
+  if (CHECKIN_NO_ELIGIBILITY_RE.test(msg)) return `无领取资格：${msg}`;
+  if (CHECKIN_FAIL_RE.test(msg)) return `签到失败：${friendlyCheckinMsg(msg)}`;
+  if (/^签到成功/.test(msg) || /\+-?\d+/.test(msg)) return `签到成功：${msg}（剩余 ${r.remain}）`;
+  return `暂未领到：${msg}（剩余 ${r.remain}）`;
+}
 async function checkin(uid) {
   try {
     const r = await api("/api/account/checkin", { uid });
-    // 未达成且可重试（活动尚未创建/上游瞬时故障）：说明会在签到窗口内自动重试，
-    // 避免用户看到「无可用签到活动」误以为失败。
-    if (!r.ok && r.retryable) toast(`暂未领到：${r.msg}（10:00–12:00 窗口内会自动重试）`);
-    else toast(r.ok ? `签到成功：${r.msg}（剩余 ${r.remain}）` : `签到：${r.msg}`);
+    // 无资格优先于「可重试」：该状态 retryable 仍为 true（上游可能在当天补发资格，
+    // 窗口内重试是免费的），但对**当前**这个账号说「会自动重试」会让人白等，
+    // 故这里明说「无需重试」并点出这不是工具故障。
+    if (CHECKIN_NO_ELIGIBILITY_RE.test(r.msg || "")) {
+      toast(`无领取资格：${r.msg}`);
+    } else if (!r.ok && r.retryable) {
+      // 未达成且可重试（活动尚未创建/上游瞬时故障）：说明会在签到窗口内自动重试，
+      // 避免用户看到「无可用签到活动」误以为失败。
+      toast(`暂未领到：${r.msg}（10:00–12:00 窗口内会自动重试）`);
+    } else {
+      toast(checkinToast(r));
+    }
+    delete detailCache[uid]; // 签到改变余额，旧明细缓存会与新顶层打架
     loadState();
   } catch (e) { toast(e.message); }
 }
@@ -1018,7 +1768,12 @@ async function checkin(uid) {
 async function refreshOne(uid) {
   try {
     const r = await api("/api/account/refresh", { uid });
-    toast(`刷新成功：剩余积分 ${r.remain}`);
+    // 单位随账号切换：token 计量渠道（如 ZCode）不叫「积分」（否则上亿 token 被读成积分）。
+    const acc = (state.accounts || []).find((x) => x.uid === uid);
+    toast(acc && acc.credits_unit === "token"
+      ? `刷新成功：剩余 ${fmtTokens(r.remain)} tokens`
+      : `刷新成功：剩余积分 ${r.remain}`);
+    delete detailCache[uid]; // 顶层已更新，旧明细缓存须作废，否则「新顶层+旧弹层」
     loadState();
   } catch (e) { toast(e.message); }
 }
@@ -1049,13 +1804,14 @@ async function checkinAll() {
   $("btnCheckinAll").disabled = true;
   try {
     const r = await api("/api/account/checkin_all", {});
+    detailCache = {}; // 批量签到改变余额，全部明细缓存作废
     const ok = (r.results || []).filter((x) => x.ok).length;
     const pending = (r.results || []).filter((x) => !x.ok && x.retryable).length;
     const skip = (state.accounts || []).filter((a) => noExplicitCheckin(a.group)).length;
     const total = (r.results || []).length + skip;
     const parts = [skip ? `成功 ${ok} / ${total}（${skip} 个无签到活动跳过）` : `成功 ${ok} / 共 ${total}`];
     if (pending) parts.push(`${pending} 个未领到将在窗口内自动重试`);
-    toast(`批量签到完成：${parts.join("；")}`);
+    toast(`批量签到完成：${parts.map(friendlyCheckinMsg).join("；")}`);
     loadState();
   } catch (e) { toast(e.message); } finally {
     $("btnCheckinAll").disabled = false;
@@ -1066,7 +1822,11 @@ async function refreshAll() {
   $("btnRefreshAll").disabled = true;
   try {
     const r = await api("/api/account/refresh_all", {});
-    toast(r.busy ? "已有刷新任务进行中" : `积分刷新完成：成功 ${r.ok} / 失败 ${r.failed}`);
+    detailCache = {}; // 顶层已全部更新，全部明细缓存作废
+    // 无积分概念的渠道（oczen/cline/自定义）后端不参与统计，无需前端再补偿数
+    toast(r.busy ? "已有刷新任务进行中"
+      : r.failed > 0 ? `积分刷新完成：成功 ${r.ok} / 失败 ${r.failed}`
+      : `积分刷新完成：全部成功（${r.ok} 个）`);
     loadState();
   } catch (e) { toast(e.message); } finally {
     $("btnRefreshAll").disabled = false;
@@ -1244,6 +2004,82 @@ function renderTaskPanel(v, delta) {
   }
 }
 
+// ---------- 一键领取额外补偿（DeepSeek 模型服务异常 500 积分） ----------
+//
+// 与成长任务的两点差别：
+//   1. **同步**：每账号只有「查状态 + 领取」两个请求，10 个账号也就几秒，
+//      不需要异步轮询那套机制；
+//   2. **先查后领**：已领取 / 活动未生效的账号不会发写请求，
+//      反复点也不会给上游添乱（按钮文案会显示「早已领取」）。
+//
+// 只覆盖 WorkBuddy 国内版账号：补偿挂在 codebuddy.cn 的 billing 域下，
+// 其他渠道没有这个活动（后端已过滤，这里只是文案上说清）。
+
+const COMP_STATUS_META = {
+  claimed:     { ico: "✓", cls: "tk-claimed", text: "本次已领取" },
+  already:     { ico: "✓", cls: "tk-done",    text: "早已领取" },
+  inactive:    { ico: "–", cls: "tk-manual",  text: "活动未生效" },
+  unsupported: { ico: "–", cls: "tk-manual",  text: "渠道不支持" },
+  error:       { ico: "✗", cls: "tk-error",   text: "失败" },
+};
+
+// claimCompensation 触发一键领取。uid 为空 = 全部 WorkBuddy 国内版账号。
+async function claimCompensation(uid) {
+  // 与成长任务共用结果面板：任务在跑时先让用户等，否则轮询会在 2.5s 内覆盖结果。
+  if (taskPollTimer) { toast("成长任务正在执行，请等本轮结束后再领取补偿"); return; }
+  const n = (state.accounts || []).filter((a) => (a.group || "workbuddy") === "workbuddy").length;
+  const who = uid ? "该账号" : `全部 WorkBuddy 国内版账号${n ? `（${n} 个）` : ""}`;
+  const msg =
+    `即将对${who}领取「DeepSeek 模型服务异常额外补偿 500 积分」。\n\n` +
+    "会先查状态再领取：已领取或活动未生效的账号不会发起领取请求。\n" +
+    "各账号截止时间以回执为准（本期至 10/22）。\n\n" +
+    "确定继续？";
+  if (!confirm(msg)) return;
+  try {
+    const v = await api("/api/account/claim_compensation", { uid: uid || "" });
+    renderCompPanel(v);
+    // 到账积分写在后端缓存里，必须显式刷新才能看到余额变化（与任务领奖同因）。
+    try {
+      const r = await api("/api/account/refresh_all", {});
+      await loadState();
+      if (v.claimed > 0) {
+        toast(`领取完成：${v.claimed} 个账号到账 +${v.credit} 分（积分已刷新${r.busy ? "，有刷新在进行" : ""}）`);
+      } else if (v.already > 0) {
+        toast(`这些账号早已领取过（${v.already} 个），无需重复操作`);
+      } else if (v.inactive > 0) {
+        toast("活动未对这些账号生效（可能已结束或未覆盖该账号）");
+      } else {
+        toast("没有可领取的账号");
+      }
+    } catch (e) { toast("领取完成，但积分刷新失败：" + e.message); }
+  } catch (e) { toast(e.message); }
+}
+
+// renderCompPanel 渲染补偿领取结果（复用任务结果面板的样式类）。
+function renderCompPanel(v) {
+  const box = $("taskPanel");
+  if (!box) return;
+  const rows = (v.results || []).map((r) => {
+    const m = COMP_STATUS_META[r.status] || COMP_STATUS_META.error;
+    const credit = r.credit > 0 ? `<span class="tk-gain">+${r.credit}</span>` : "";
+    const end = r.end_time ? `<span class="tk-sum">截止 ${esc(r.end_time)}</span>` : "";
+    const msg = r.msg ? `<span class="tk-err">${esc(r.msg)}</span>` : "";
+    return `<div class="task-acct">
+      <div class="task-acct-head">${esc(r.label || "")}<span class="tk-code">${esc((r.uid || "").slice(0, 8))}</span>
+        <span class="${m.cls}">${m.ico} ${m.text}</span>${credit}${end}${msg}</div>
+    </div>`;
+  }).join("");
+  box.innerHTML = `<div class="task-panel-head">
+      <span class="tk-title">额外补偿领取结果</span>
+      <span class="tk-ok">${v.accounts} 个账号 · 新领 ${v.claimed} · 已领 ${v.already} · 未生效 ${v.inactive}${v.error ? ` · 失败 ${v.error}` : ""}</span>
+      <span class="tk-spacer"></span>
+      <button class="btn small" id="btnCompClose">关闭</button>
+    </div>${rows}`;
+  box.classList.remove("hidden");
+  const closeBtn = $("btnCompClose");
+  if (closeBtn) closeBtn.onclick = () => box.classList.add("hidden");
+}
+
 // clearCreditDelta 清掉增量快照，使卡片角标不再显示。
 function clearCreditDelta() {
   creditsBefore = null;
@@ -1277,25 +2113,92 @@ const NO_CHECKIN_LOGIN_HINT = {
   workbuddyai: "（无需手动签到，定时自动对话保活并领取日活奖励）",
   qwenwork: "（每日积分服务端 00:00 自动发放；若浏览器已登录千问办公则全自动完成，否则需扫码一次）",
   monkeycode: "（凭据来自本机已登录的 MonkeyCode 客户端；上游无续期接口，客户端重新登录后需再次导入）",
-  raccoon: "（凭据来自本机已登录的小浣熊客户端；access_token 约 2 小时，本工具会自动续期）",
+  raccoon: "（支持「网页版登录」与「从客户端导入」两种方式；access_token 约 1 小时，本工具会自动续期，上游刷新时会轮换 refresh_token）",
   loomy: "（凭据来自本机已登录的 Loomy 客户端；上游无续期接口，约 14 天后需重新登录并再次导入）",
   glm: "（登录后请按下方指引复制 refresh_token 粘贴回来）",
+  cline: "（无需登录：在 app.cline.bot 注册账号，Account / API Keys → Create API Key 后粘贴即可；Key 不过期也不轮换）",
+  officeace: "（凭据来自本机已登录的 OfficeAce 客户端；每日签到的临时凭据约 2 小时有效，本工具会自动续期）",
+  minimax: "（设备码授权：点「浏览器登录」后在新页面确认授权，本工具会自动轮询直到完成；可重复添加多个账号）",
+  lobsterai: "（本机回调授权：点「浏览器登录」后在有道页面完成登录，浏览器会跳回本机完成授权；支持多个账号）",
+  zcode: "（设备授权：点「浏览器登录」后在智谱页面完成授权，本工具会轮询直到完成；⚠️ 本渠道的积分领取依赖网页验证码，本工具不自动领取）",
+  gemini: "（本机回调授权：点「浏览器登录」后完成 Google 账号授权，浏览器会跳回本机；支持多个账号。⚠️ 额度以「配额窗口剩余百分比」呈现，不是积分数）",
+  codearts: "（PKCE 授权：点「浏览器登录」后在华为云授权页完成授权，浏览器会跳回本机；支持多个账号。⚠️ 免费额度按 UTC+8 自然日重置）",
 };
 function promptLogin(channel) {
   pendingChannel = channel;
   const name = chLabel(channel);
   pendingAction = isImportLocal(channel) ? "import" : "login";
+  // 「账号标识」输入行：只对**上游不提供稳定身份字段**的渠道显示（当前是 CodeArts）。
+  // 为什么要把区分账号的责任交给用户：上游不回传任何身份信息，账号 ID 只能落到每次新签发的
+  // 临时凭据上 ⇒ 既无法区分多个账号、重复登录又会被写成新条目（见 docs/渠道接入备忘.md）。
+  const labelRow = $("lcLabelRow");
+  if (labelRow) {
+    const need = channel === "codearts";
+    labelRow.classList.toggle("hidden", !need);
+    if (need) {
+      const inp = $("lcAccountLabel");
+      if (inp) inp.value = "";
+    }
+  }
   // 次按钮默认隐藏，只在「两条路都通」的渠道（小浣熊）里显示。
   const altBtn = $("btnLoginAlt");
   altBtn.classList.add("hidden");
   altBtn.onclick = null;
 
-  // 浏览器授权登录渠道：主按钮走浏览器授权 + 协议回调接管，次按钮回退到本机客户端导入。
-  if (hasProtocolLogin(channel)) {
+  // OfficeAce（华为云果办）：主按钮走自助 OAuth（打开华为云授权页），
+  // 次按钮回退到「从本机 OfficeAce 客户端导入」。
+  if (channel === "officeace") {
+    pendingAction = "login";
+    $("lcTitle").textContent = "添加 OfficeAce 账号";
+    $("lcMsg").innerHTML = `点击「浏览器登录」将打开<b>华为云授权页</b>，用你的华为账号登录后，`
+      + `本工具会自动捕获凭据并添加账号（无需安装 OfficeAce 桌面端）。`
+      + `也可以点「从客户端导入」直接读取本机已登录的 OfficeAce 桌面端凭据。`
+      + `<div class="glm-warn" style="margin-top:10px">`
+      + `<div class="glm-warn-title">提示</div>`
+      + `对话走不过期的网关凭据；每日签到的临时凭据约 2 小时有效，本工具会自动续期。`
+      + `若同一账号的 refresh_token 被本工具与桌面端共用可能互踢，需在本工具单独登录一次。`
+      + `</div>`;
+    $("btnLoginConfirm").textContent = "浏览器登录";
+    altBtn.textContent = "从客户端导入";
+    altBtn.classList.remove("hidden");
+    altBtn.onclick = () => { pendingAction = "import"; confirmLogin(); };
+    $("loginConfirmOverlay").classList.remove("hidden");
+    return;
+  }
+
+  // 网页版登录渠道：主按钮走「拉起浏览器 + 自动捕获凭据」，次按钮回退到本机客户端导入。
+  if (hasWebLogin(channel)) {
     pendingAction = "login";
     $("lcTitle").textContent = "添加 " + name + " 账号";
-    $("lcMsg").textContent = `点击「登录${name}」将打开浏览器授权页，登录完成后本工具会自动接管回调并保存账号。`
-      + `登录期间会把 ${name} 的协议注册临时指向本工具（结束即恢复），请勿在此期间启动${name}客户端，否则协议注册会被它覆盖。`
+    if (channel === "loomy") {
+      // Loomy 的机制与小浣熊不同：不拉浏览器、不捕获凭据，而是由本工具起一个本机登录引导页，
+      // 用户在页面里填手机号 + 短信验证码（见 internal/login_loomy）。
+      // 另外它**没有 refresh 端点**，所以不存在「互踢 / 自动续期」那一段说明。
+      $("lcMsg").innerHTML = `点击「登录${name}」会打开一个<b>本机登录页</b>（地址在你的电脑上，不经过本工具的服务器），`
+        + `请在其中输入手机号、接收并填写短信验证码，登录完成后本工具会自动保存账号。`
+        + `<div class="glm-warn" style="margin-top:10px">`
+        + `<div class="glm-warn-title">⚠️ 关于登录有效期</div>`
+        + `Loomy 的登录态<b>约 14 天</b>到期，且上游<b>没有刷新接口</b> —— `
+        + `到期后需要重新点「登录${name}」再登一次，或改用「从客户端导入」重新读取已登录客户端的凭据。`
+        + `</div>`
+        + `也可以改用「从客户端导入」：直接读取本机已登录客户端的凭据。`;
+      $("btnLoginConfirm").textContent = "登录" + name;
+      altBtn.textContent = "从客户端导入";
+      altBtn.classList.remove("hidden");
+      altBtn.onclick = () => { pendingAction = "import"; confirmLogin(); };
+      $("loginConfirmOverlay").classList.remove("hidden");
+      return;
+    }
+    $("lcMsg").innerHTML = `点击「登录${name}」会打开一个<b>独立的浏览器窗口</b>（不影响你日常浏览器的登录态），`
+      + `请在其中正常登录（扫码 / 手机号 / 微信均可），登录完成后本工具会自动捕获凭据并保存账号。`
+      + `<div class="glm-warn" style="margin-top:10px">`
+      + `<div class="glm-warn-title">⚠️ 关于登录态互踢</div>`
+      + `本工具会用捕获到的凭据<b>自动续期</b>（上游刷新时会轮换 refresh_token）。`
+      + `若你把这个账号的凭据<b>同时</b>用在本工具和浏览器 / 官方客户端上，两边会争抢同一个 refresh_token，`
+      + `可能出现<b>其中一侧被挤下线</b>的情况（上游可能对同一账号限制单会话）。`
+      + `想两边同时用，请在本工具里点「登录${name}」<b>单独登录一次</b>（本流程新建独立会话），`
+      + `而不是从浏览器复制凭据粘进来。`
+      + `</div>`
       + `也可以改用「从客户端导入」：直接读取本机已登录客户端的凭据。`;
     $("btnLoginConfirm").textContent = "登录" + name;
     altBtn.textContent = "从客户端导入";
@@ -1305,6 +2208,17 @@ function promptLogin(channel) {
     return;
   }
 
+  // 粘贴凭据型渠道（Cline）：弹专用输入框，而不是「打开浏览器登录」。
+  // Cline 的凭据是官方 API Key，创建动作发生在 app.cline.bot 网页里，本工具无法代劳，
+  // 所以这里没有轮询/回调，只有一次「验证 + 落盘」（后端只调 /api-keys，零 token 消耗）。
+  if (isPasteKey(channel)) {
+    $("clineKeyInput").value = "";
+    $("clineErr").textContent = "";
+    $("clineWarn").classList.add("hidden");
+    $("clineOverlay").classList.remove("hidden");
+    setTimeout(() => $("clineKeyInput").focus(), 30);
+    return;
+  }
   // 纯导入型渠道：文案与动作都不同（读本机客户端凭据，而不是打开浏览器登录）。
   if (isImportLocal(channel)) {
     $("lcTitle").textContent = "导入 " + name + " 账号";
@@ -1314,8 +2228,27 @@ function promptLogin(channel) {
     $("loginConfirmOverlay").classList.remove("hidden");
     return;
   }
+  // CodeArts：授权页必须避开日常浏览器里的华为云登录态（否则永远被授权成已登录的那个账号），
+  // 后端会用**无痕窗口**打开；同时需要用户填「账号标识」来区分多个华为账号。
+  if (channel === "codearts") {
+    $("lcTitle").textContent = "添加 CodeArts 账号";
+    $("lcMsg").innerHTML = `点击「登录 CodeArts」会打开一个<b>无痕浏览器窗口</b> —— `
+      + `无痕会话不带日常浏览器的华为云登录态（否则你只会被授权成<b>已登录的那个</b>账号）。`
+      + `请在其中登录<b>你想要添加的那个</b>华为账号。`
+      + `<div class="glm-warn" style="margin-top:10px">`
+      + `<div class="glm-warn-title">为什么要填「账号标识」</div>`
+      + `华为云不回传账号身份信息，本工具无法自动分辨「同一账号重新登录」与「另一个账号」。`
+      + `所以：<b>留空</b> = 覆盖已有的 CodeArts 账号；<b>填写</b>（例如"工作号"）= 作为独立账号并存。`
+      + `以后重登同一个账号时填<b>同一个标识</b>，就会覆盖它而不是再新增一个。`
+      + `</div>`;
+    $("btnLoginConfirm").textContent = "登录 CodeArts";
+    $("loginConfirmOverlay").classList.remove("hidden");
+    return;
+  }
   $("lcTitle").textContent = "添加 " + name + " 账号";
-  $("lcMsg").textContent = noExplicitCheckin(channel)
+  // 此处只会收到内建渠道名（自定义渠道走设置弹层，不经 promptLogin），
+  // 故直接查内建名单，不走动态判定的 noExplicitCheckin()。
+  $("lcMsg").textContent = NO_EXPLICIT_CHECKIN.has(channel)
     ? `点击「登录${name}」将打开浏览器窗口，请按照指示正常登录${name}账号，登录成功后关闭浏览器窗口即可。${NO_CHECKIN_LOGIN_HINT[channel] || ""}`
     : `点击「登录${name}」将打开浏览器窗口，请按照指示正常登录${name}账号，登录成功后关闭浏览器窗口即可。`;
   $("btnLoginConfirm").textContent = "登录" + name;
@@ -1326,7 +2259,17 @@ function confirmLogin() {
   if (!pendingChannel) return;
   // 按 pendingAction 分发：小浣熊两种动作都支持，不能只看渠道是否属于导入型。
   if (pendingAction === "import") importLocal(pendingChannel);
-  else startLogin(pendingChannel);
+  else if (pendingChannel === "officeace") startOfficeAceWebLogin();
+  else startLogin(pendingChannel, loginLabelValue());
+}
+
+// loginLabelValue 读取登录弹窗里的「账号标识」：只对需要它的渠道（CodeArts）有意义，
+// 其余渠道那一行是隐藏的，恒返回空串。
+function loginLabelValue() {
+  const row = $("lcLabelRow");
+  if (!row || row.classList.contains("hidden")) return "";
+  const inp = $("lcAccountLabel");
+  return inp ? inp.value.trim() : "";
 }
 
 // importLocal 从本机已登录的官方客户端导入凭据（MonkeyCode / 小浣熊 / Loomy）。
@@ -1344,18 +2287,74 @@ async function importLocal(channel) {
   }
 }
 
-async function startLogin(channel) {
+async function startLogin(channel, accountLabel) {
+  // 渠道分派：OfficeAce 是**两步**流程（华为云授权码 + 云端轮询捕获），专属入口是
+  // startOfficeAceWebLogin（→ POST /api/login/officeace_auto）。它与下面
+  // `POST /api/login/start` 的形态不同——后者一次调用就返回 auth_url，且后端
+  // StartLoginFor 不会为 officeace 拉起轮询。这里收口成一个入口，卡片上的 ⟳
+  // 与「添加账号」都走同一条路，避免再出现「前端能点、后端不认」的死按钮。
+  // （2026-10-18：卡片 ⟳ 曾直接 startLogin('officeace') 而只弹 unknown login provider。）
+  if (channel === "officeace") return startOfficeAceWebLogin();
   try {
-    const r = await api("/api/login/start", { channel });
+    const r = await api("/api/login/start", { channel, account_label: accountLabel || "" });
     const url = r.auth_url;
     if (!url) { toast("无法获取登录链接"); return; }
     $("loginTitle").textContent = `添加 ${chLabel(channel)} 账号`;
-    $("loginMsg").textContent = hasProtocolLogin(channel)
-      ? `请在浏览器新窗口中完成${chLabel(channel)}登录；完成后本工具会自动接管回调并保存账号（期间请勿启动${chLabel(channel)}客户端）。`
-      : "请在浏览器新窗口中完成登录…";
+    // 三种情形（顺序即优先级）：
+    //  ① 后端已用**无痕窗口**拉起（CodeArts）—— 绝不能 window.open：那会在日常浏览器里再开一个
+    //     带登录态的标签页，用户又会被授权成老账号，无痕那一步就白做了；
+    //  ② 网页版登录渠道（glm / 小浣熊）—— 后端用独立 profile + CDP 拉起，同理不能 open
+    //     （那个标签页没有调试端口，捕获不到）；
+    //  ③ 其余渠道 —— 由前端 window.open 打开（它们不需要隔离登录态）。
+    if (r.backend_opened) {
+      $("loginMsg").textContent = `已为你打开一个**无痕窗口**，请在其中完成 ${chLabel(channel)} 登录；`
+        + `登录完成后无需任何操作，本工具会自动添加账号。`;
+    } else if (channel === "loomy") {
+      // Loomy 与 ② 相反：后端**不**拉浏览器，返回的是本机登录引导页地址，
+      // 必须由前端 window.open 打开（见 internal/login_loomy）。它也不「捕获凭据」——
+      // 用户在引导页里填手机号 + 短信验证码，后端据此换 session。
+      $("loginMsg").textContent = `已为你打开 Loomy 登录页，请在其中输入手机号并填写短信验证码；`
+        + `登录完成后本工具会自动添加账号。登录态约 14 天后到期，届时需重新登录。`;
+      window.open(url, "_blank", "noopener,noreferrer");
+    } else if (hasWebLogin(channel)) {
+      $("loginMsg").textContent = `已为你打开一个独立的浏览器窗口，请在其中完成${chLabel(channel)}登录；`
+        + `登录完成后无需任何操作，本工具会自动捕获凭据并添加账号。`;
+    } else {
+      $("loginMsg").textContent = "请在浏览器新窗口中完成登录…";
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
     $("loginOverlay").classList.remove("hidden");
     $("btnCopyUrl").dataset.url = url;
-    window.open(url, "_blank", "noopener,noreferrer");
+    // 2026-10-18（H9）：后端告知这次登录是否需要轮询。
+    // 改造前这里**无条件** startLoginPoll()，而 GLM 属于「只给链接、不跑流程」的渠道
+    // （后端不置 loginBusy、不起 pollLogin）⇒ 轮询看到 login_busy=false 便提示
+    // 「登录完成，正在同步账号…」，实际什么都没发生 —— 假成功。
+    // 现在只有真发起登录流程的渠道才轮询；只给链接的渠道引导用户改用粘贴入口。
+    if (r.needs_poll === false) {
+      $("loginMsg").textContent = "已为你打开登录页。请按页面提示登录后，"
+        + "从浏览器 Cookie 中取出 refresh_token 粘贴到下方，再点「提交」。";
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    // 手动回调兜底（LobsterAI / CodeArts / TraeWork，R96③/R97/#98）。
+    // LobsterAI 的上游 portal **只认** http://127.0.0.1:<port>/auth/callback
+    // （hostname 严格等于 127.0.0.1，否则它丢弃该地址、改发 lobsterai:// deep-link，
+    // 见 docs/决议项.md R97）；TraeWork 的回调写死 127.0.0.1:<随机端口> 且监听只有
+    // 5 分钟寿命（issue #98）。所以浏览器与网关不同机（或监听超时）时，浏览器会停在
+    // 一条打不开的 127.0.0.1 页面上 —— 那条 URL 里就有凭据：把它粘回来即可
+    // （后端解析出 code/token 自行换凭据）。
+    // 想全自动：把该端口固定（config.login.lobsterai_callback_port）并在浏览器所在机器上
+    // 建一条 `ssh -L 127.0.0.1:<port>:127.0.0.1:<port> <网关>` 转发，之后无需粘贴。
+    if (r.manual_callback) {
+      $("lcCallbackHint").textContent =
+        "登录完成后若浏览器停在一条打不开的 127.0.0.1 地址上（上游只允许回调到 127.0.0.1，"
+        + "从别的机器打开面板时必然如此）：把那条完整 URL（含 ? 之后的全部参数）复制到下面提交，网关会立刻换取凭据。"
+        + "浏览器与网关同一台机器时无需理会此项；若已在浏览器所在机器建好端口转发，也会自动完成。";
+      $("lcCallbackRow").classList.remove("hidden");
+    } else {
+      $("lcCallbackRow").classList.add("hidden");
+      $("lcCallbackUrl").value = "";
+    }
     startLoginPoll();
   } catch (e) {
     toast(e.message);
@@ -1364,6 +2363,8 @@ async function startLogin(channel) {
 
 async function cancelLogin() {
   try {
+    // 仅在 OfficeAce 流程进行中才调它的取消端点（否则对其它渠道是无谓的 400 噪音）。
+    if (oaPoll) { stopOfficeAcePoll(); cancelOfficeAceLogin(); }
     await api("/api/login/cancel", {});
     stopLoginPoll();
     $("loginOverlay").classList.add("hidden");
@@ -1371,10 +2372,90 @@ async function cancelLogin() {
   } catch (e) { toast(e.message); }
 }
 
+// ---- OfficeAce 自助登录（华为云 OAuth 授权码 + PKCE）----
+let oaPoll = null;
+async function startOfficeAceWebLogin() {
+  try {
+    const r = await api("/api/login/officeace_auto", {});
+    const url = r.auth_url;
+    if (!url) { toast("无法获取登录链接"); return; }
+    $("loginTitle").textContent = "添加 OfficeAce 账号";
+    $("loginMsg").textContent = "已在本设备新标签页打开华为云授权页，请在其中登录并授权；"
+      + "完成后本工具会自动捕获凭据（捕获走云端轮询，与在哪台设备打开无关）。"
+      + "若浏览器拦截了弹窗未打开，可点「复制链接」手动打开。";
+    $("loginOverlay").classList.remove("hidden");
+    $("btnCopyUrl").dataset.url = url;
+    if (r.warning) toast(r.warning, 6000);
+    // 在用户当前设备打开授权页（与其它渠道一致）。
+    // 注意：带 noopener 时 window.open 的返回值**恒为 null**（MDN windowFeatures），
+    // 不能拿它判断是否被弹窗拦截（否则每次登录都误报「被拦截」）。故：先开、后断链——
+    // 不带 feature 打开才能拿到窗口句柄，随后手动置 opener=null 兼顾安全。
+    const w = window.open(url, "_blank");
+    if (w) {
+      try { w.opener = null; } catch (e) { /* 跨域时可能被拒，忽略 */ }
+    } else {
+      toast("浏览器拦截了弹窗，请点「复制链接」手动打开", 6000);
+    }
+    startOfficeAcePoll();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function startOfficeAcePoll() {
+  stopOfficeAcePoll();
+  oaPoll = setInterval(async () => {
+    try {
+      const st = await api("/api/login/officeace_auto_status");
+      if (st.status === "done") {
+        stopOfficeAcePoll();
+        $("loginOverlay").classList.add("hidden");
+        toast(`OfficeAce 账号已添加${st.nickname ? "：" + st.nickname : ""}`);
+        await loadState();
+        refreshFees();
+      } else if (st.status === "failed" || st.status === "expired") {
+        stopOfficeAcePoll();
+        toast(st.error || "OfficeAce 登录失败", 8000);
+      } else if (st.status === "canceled" || st.status === "idle") {
+        stopOfficeAcePoll();
+      }
+    } catch (e) { /* 忽略瞬时错误 */ }
+  }, 2000);
+}
+
+function stopOfficeAcePoll() {
+  if (oaPoll) { clearInterval(oaPoll); oaPoll = null; }
+}
+
+function cancelOfficeAceLogin() {
+  stopOfficeAcePoll();
+  api("/api/login/officeace_auto_cancel", {}).catch(() => {});
+}
+
 function copyUrl() {
   const url = $("btnCopyUrl").dataset.url;
   if (!url) { toast("暂无链接"); return; }
-  navigator.clipboard.writeText(url).then(() => toast("链接已复制")).catch(() => toast("复制失败，请手动复制"));
+  // 必须走 copyText：局域网 http:// 是非安全上下文，navigator.clipboard 被浏览器
+  // 直接禁用，需降级 execCommand（与顶栏 API-Key 复制同一 helper）。
+  copyText(url, "链接");
+}
+
+// 手动提交授权回调地址（局域网/远程兜底，只对 manual_callback=true 的渠道显示，
+// 当前是 CodeArts、LobsterAI 与 TraeWork）。
+// 语义：只把 code 交给网关换凭据，用户不需要交出任何 token。
+async function submitCallback() {
+  const url = ($("lcCallbackUrl").value || "").trim();
+  if (!url) { toast("请先粘贴浏览器地址栏里的完整 URL"); return; }
+  try {
+    await api("/api/login/callback", { url });
+    $("lcCallbackUrl").value = "";
+    $("lcCallbackHint").textContent = "已提交，正在换取凭据…";
+  } catch (e) {
+    // 保留弹层与已填内容：端口粘错、缺 code 这类错误下登录流程往往仍在进行，
+    // 用户需要就地改正后重试（关掉弹层等于把输入丢了）。
+    // 真正的终态失败（授权被拒/超时）由 2s 状态轮询统一收尾，避免重复提示。
+    $("lcCallbackHint").textContent = "提交失败：" + e.message;
+  }
 }
 
 // 登录轮询
@@ -1461,6 +2542,31 @@ function cancelGLMLogin() {
   $("glmOverlay").classList.add("hidden");
 }
 
+// submitClineKey 提交用户粘贴的 Cline 官方 API Key。
+// 后端只做「GET /api/v1/api-keys 验证 + 落盘」，零 token 消耗；
+// 返回的 warning 非空表示「这把 Key 与已有账号同属一个 Cline 账号」——
+// 官方配额按账号计（…UsageCostUSDPerUser），同账号多 Key 不会扩额度，必须显式告知。
+async function submitClineKey() {
+  const key = ($("clineKeyInput").value || "").trim();
+  if (!key) { $("clineErr").textContent = "请粘贴 API Key（sk_ 开头）"; return; }
+  const btn = $("btnClineSubmit");
+  btn.disabled = true;
+  $("clineErr").textContent = "验证中…";
+  try {
+    const r = await api("/api/login/cline_key", { api_key: key });
+    $("clineOverlay").classList.add("hidden");
+    $("clineKeyInput").value = "";
+    if (r && r.warning) toast(r.warning);
+    toast("Cline 账号已添加");
+    await loadState();
+    refreshFees();
+  } catch (e) {
+    $("clineErr").textContent = e.message || "验证失败";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 // 手工兜底：粘贴 refresh_token
 async function submitGLMToken() {
   const token = ($("glmTokenInput").value || "").trim();
@@ -1505,6 +2611,14 @@ async function saveTimes(times) {
 }
 
 // ---------- 开机自启（设置弹层内，切换立即保存） ----------
+// ---------- 请求体摘要（诊断开关，设置弹层内，切换立即保存） ----------
+async function toggleBodyLog() {
+  try {
+    await api("/api/config/body_log", { on: $("chkBodyLog").checked });
+    toast("设置已保存");
+  } catch (e) { toast(e.message); loadState(); }
+}
+
 async function toggleAutostart() {
   try {
     await api("/api/config/autostart", { on: $("chkAutostart").checked });
@@ -1512,21 +2626,292 @@ async function toggleAutostart() {
   } catch (e) { toast(e.message); loadState(); }
 }
 
-// ---------- 设置弹层（统一配置：监听/API-Key/签到/自启/模型路由/渠道代理） ----------
-// PROXY_CHANNELS 渠道上游代理列表（顺序与面板渠道序一致；旧 qoder 已下线不提供代理配置）。
-const PROXY_CHANNELS = ["workbuddy", "workbuddyai", "qodercn", "qodercom", "traework", "qwenwork", "glm", "monkeycode", "raccoon", "loomy"];
-const PROXY_HINT = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言" };
+// ---------- 模型降级链（设置弹层：原模型无可用账号时按链顶备胎，不粘滞自动切回） ----------
+// fbRules 编辑态副本（openSettings 时从 state.model_fallback 深拷贝；保存成功后由 loadState 刷新）
+let fbRules = [];
 
-// renderProxyList 按当前 state.proxies 渲染每渠道一个输入行。
-function renderProxyList() {
-  const proxies = state.proxies || {};
-  $("proxyList").innerHTML = PROXY_CHANNELS.map((ch) => {
-    const val = proxies[ch] || "";
-    return `<div class="row proxy-row">
-      <label class="lbl wide" title="${esc(PROXY_HINT[ch] || ch)}">${esc(PROXY_HINT[ch] || ch)}</label>
-      <input class="input grow proxy-input" data-ch="${ch}" value="${esc(val)}" spellcheck="false" placeholder="如 socks5://127.0.0.1:1080（留空直连）">
+// fbFromSet 汇总当前全部主力模型ID（跨规则）：备胎候选/追加/清洗统一从这里排除——
+// 同一 ID 不允许既是某规则主力又出现在任何备胎链。每次下拉 render 实时取，主力列表变更即同步可选范围。
+function fbFromSet() {
+  const s = {};
+  for (const r of fbRules) if (r.from) s[r.from] = true;
+  return s;
+}
+// fbSanitize 就地清洗 fbRules：从每条备胎链剔除任意规则的主力ID（含历史脏数据），返回剔除条数。
+// renderFbList 每轮渲染前先过一遍（所有编辑路径都经 renderFbList 重渲染，chip 索引始终与清洗后
+// 数组一致），保存前再兜底一次——渲染/比对/落盘共用同一份互斥干净数据。
+function fbSanitize() {
+  const fs = fbFromSet();
+  let dropped = 0;
+  for (const r of fbRules) {
+    const keep = r.to.filter((t) => !fs[t]);
+    dropped += r.to.length - keep.length;
+    r.to = keep;
+  }
+  return dropped;
+}
+
+// updateFbDirty / updateEffDirty：编辑态与服务端态比对，有差异时亮「未保存」提示。
+// 比对基于 JSON 序列化（fbRules/to 顺序敏感——改序也算未保存，语义正确）；保存成功
+// 后服务端态刷新（loadState → openSettings 未重开时由 save 回调手动清），零差异即隐藏。
+function fbServerRules() { return JSON.stringify(state.model_fallback || []); }
+function updateFbDirty() {
+  const el = $("fbDirty");
+  if (!el) return;
+  el.style.display = JSON.stringify(fbRules) === fbServerRules() ? "none" : "";
+}
+function updateEffDirty() {
+  const el = $("effDirty");
+  if (!el) return;
+  const effs = state.reasoning_efforts || {};
+  const g = $("effGlobalInput").value.trim();
+  const cur = {}; if (g) cur["*"] = g;
+  for (const r of effRules) cur[r.model] = r.effort;
+  const norm = (o) => JSON.stringify(Object.keys(o).sort().map((k) => [k, o[k]]));
+  el.style.display = norm(cur) === norm(effs) ? "none" : "";
+}
+
+// renderFbList 渲染降级链编辑区：每条规则一个卡片区块（自定义渠道卡片同款设计语言）——
+// head 行 = 「规则 N」徽标 + 主力模型ID 输入框 + 🗑；body = 备胎链 chips（含序号与拖拽）+ 添加行。
+// chip 序号即降级优先级（内核 pickModelFallback 按 rule.To 顺序取第一个可承载备胎），
+// 拖动改序只改编辑态 fbRules，点「保存降级链」才落盘（语义与上游一致）。
+// 交互全部事件委托在 #fbList 上（data-del-rule / data-del-to / data-add-to / data-edit-idx /
+// dragstart / dragover / drop / dragend），每轮 innerHTML 重建后委托仍然有效。
+function renderFbList() {
+  const dropped = fbSanitize(); // 互斥校验：主力ID不出现在任何备胎链（chip 索引与数据一致）
+  if (dropped > 0) toast(`已自动剔除 ${dropped} 个与主力模型互斥的备胎`); // 唯一剔除时机：打开面板首轮（历史脏数据）/ 改主力波及他链
+  const rows = fbRules.map((r, i) => {
+    const tos = r.to.map((t, j) =>
+      `<span class="fb-to-chip" draggable="true" data-chip="${i}:${j}" data-model="${esc(t)}" title="${esc(t)}（拖动调整顺序，序号 = 降级优先级）">`
+      + `<span class="chip-idx">${j + 1}</span><span class="chip-grip">⠿</span>${esc(t)}`
+      + `<a data-del-to="${i}:${j}" title="移除该备胎">×</a></span>`
+    ).join("");
+    return `<div class="fb-rule-card">
+      <div class="fb-rule-head">
+        <span class="fb-rule-badge">规则 ${i + 1}</span>
+        <span class="pk-wrap fb-from-wrap"><input class="input fb-from-edit" data-edit-idx="${i}" value="${esc(r.from)}" spellcheck="false" title="主力模型ID（channel/model，可编辑；失焦或回车确认，点「保存降级链」生效）" placeholder="主力模型ID（channel/model）"></span>
+        <button class="icon-btn" data-del-rule="${i}" title="删除整条规则">🗑</button>
+      </div>
+      <div class="fb-rule-body">
+        <div class="fb-chips">${tos || `<span class="hint">（无备胎）</span>`}</div>
+        <div class="row" style="margin-top:2px">
+          <span class="pk-wrap grow"><input class="input fb-to-add" data-add-idx="${i}" spellcheck="false" placeholder="＋ 备胎模型ID（模糊搜索 / 回车添加 / 逗号分隔多个）"></span>
+          <button class="icon-btn" data-add-to="${i}" title="把添加框中的备胎追加到该规则末尾">＋</button>
+        </div>
+      </div>
     </div>`;
   }).join("");
+  $("fbList").innerHTML = rows || `<div class="fb-empty">暂无规则——原模型无可用账号时将直接返回 503 提示</div>`;
+  $("fbErr").textContent = "";
+  attachFbPickers();
+  updateFbDirty();
+}
+
+// parseModelList 解析备胎输入：逗号/空格/换行分隔多个 channel/model，本地形态校验。
+function parseModelList(raw) {
+  const out = [];
+  for (const p of String(raw || "").split(/[,，\s]+/)) {
+    const t = p.trim();
+    if (!t) continue;
+    if (!/^[^/]+\/.+/.test(t)) return [null, `备胎模型 ${t} 需为 channel/model 形式（如 workbuddyai/glm-5.2）`];
+    out.push(t);
+  }
+  return [out, ""];
+}
+
+// attachFbPickers 给 renderFbList 产出的行内输入框挂模糊搜索下拉（每轮 innerHTML 重建后重挂）：
+// - 主力模型ID（.fb-from-edit）：单选下拉，选中回填；Enter 无候选时 blur 确认（原行为）。
+// - 行内备胎添加框（.fb-to-add）：多选下拉——点选即追加到备胎链末尾（精确等值去重，
+//   与上游 to.includes 全等语义一致）、已上链模型从候选隐藏、可连续选择多个。
+function attachFbPickers() {
+  for (const inp of $("fbList").querySelectorAll(".fb-from-edit")) {
+    const self = fbRules[+inp.dataset.editIdx].from; // 自身当前值保留可见，仅排除其他规则主力（重复由 change 唯一性校验兜底）
+    attachModelPicker(inp, { excludeSet: () => { const s = { ...fbFromSet() }; delete s[self]; return s; } });
+  }
+  for (const inp of $("fbList").querySelectorAll(".fb-to-add")) {
+    const i = +inp.dataset.addIdx;
+    attachModelPicker(inp, {
+      stayOpen: true,
+      excludeSet: () => { const s = { ...fbFromSet() }; for (const t of (fbRules[i] && fbRules[i].to) || []) s[t] = true; return s; },
+      onPick: (id) => {
+        const r = fbRules[i];
+        if (!r) return;
+        if (fbFromSet()[id] || r.to.includes(id)) return; // 主力ID或已上链 → 不追加（候选已隐藏，双保险）
+        r.to.push(id);
+        renderFbList();
+        toast(`已加入备胎链第 ${r.to.length} 位（点保存生效）`);
+      },
+    });
+  }
+}
+
+async function saveModelFallback() {
+  try {
+    fbSanitize(); // 落盘前互斥兜底（正常路径 renderFbList 已清洗过，防御未来路径）
+    await api("/api/config/model_fallback", { rules: fbRules });
+    toast("降级链已保存（热生效）");
+    $("fbErr").textContent = "";
+    state.model_fallback = JSON.parse(JSON.stringify(fbRules)); // 即时同步服务端态基准，提示随之熄灭
+    updateFbDirty();
+    loadState();
+  } catch (e) { $("fbErr").textContent = e.message; }
+}
+
+// ---------- 自定义渠道（OpenAI 兼容，R66） ----------
+// RESERVED_CHANNEL_NAMES 与 provider.BuiltinKinds() 同集（+ ModelNamespaces 的上游命名空间）：
+// 与内建渠道同名时 server/app 两层会指向不同 Runtime，故前端先给即时反馈（后端同样会拒）。
+// ⚠️ 新增内建渠道时这里要同步：漏一个就变成「前端不拦、保存后才报错」
+//   （ui-static-check 会对比 provider.go 的 Kind 常量）。
+const RESERVED_CHANNEL_NAMES = new Set([
+  "workbuddy", "workbuddyai", "traework", "traecode", "qoder", "qodercn", "qodercom",
+  "qwenwork", "monkeycode", "raccoon", "loomy", "oczen", "kilo", "minimax", "lobsterai",
+  "zcode", "gemini", "codearts", "glm", "cline", "officeace",
+  "cline-free", // ModelNamespaces：上游 ID 自带命名空间，自定义渠道不得占用
+]);
+let editCustomChannels = [];
+
+// parseTokens 解析带 k/M 单位的 token 数（如 1M→1000000、64k→64000）；纯数字原样返回。
+function parseTokens(str, fallback) {
+  if (str === undefined || str === null || str === "") return fallback || 0;
+  if (typeof str === "number") return str;
+  const s = String(str).trim();
+  if (!s) return fallback || 0;
+  const upper = s.toUpperCase();
+  let mult = 1;
+  let numStr = upper;
+  if (upper.endsWith("M")) {
+    mult = 1000000;
+    numStr = upper.slice(0, -1).trim();
+  } else if (upper.endsWith("K")) {
+    mult = 1000;
+    numStr = upper.slice(0, -1).trim();
+  }
+  const n = parseFloat(numStr);
+  if (isNaN(n) || n < 0) return fallback || 0;
+  return Math.round(n * mult);
+}
+
+// formatTokenCount 反向格式化：优先整数 k/M（1M、64k），非整除时保留一位小数。
+function formatTokenCount(num) {
+  if (!num) return "—";
+  if (num >= 1000000 && num % 100000 === 0) return `${num / 1000000}M`;
+  if (num >= 1000 && num % 1000 === 0) return `${num / 1000}k`;
+  if (num >= 1000000) return `${(num / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (num >= 1000) return `${(num / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(num);
+}
+
+function renderCustomChList() {
+  // R85：每个 Provider 一个区块，Provider 自己一行（信息 + 操作），
+  // 它下面的每个模型也各占一行（模型信息 + 操作）。**任何一行都不换行**，
+  // 靠横向滚动兜底而不是折行。
+  const blocks = editCustomChannels.map((c, i) => {
+    const keyMask = c.api_key ? (c.api_key.length > 8 ? c.api_key.slice(0, 3) + "…" + c.api_key.slice(-4) : "••••••") : "无密钥";
+    const models = c.models || [];
+
+    const modelRows = models.map((m, j) => {
+      const mid = typeof m === "string" ? m : m.id;
+      const ctxNum = typeof m === "object" ? parseTokens(m.context_window, 0) : 0;
+      const outNum = typeof m === "object" ? parseTokens(m.max_tokens, 0) : 0;
+      const ctx = ctxNum ? formatTokenCount(ctxNum) : "—";
+      const out = outNum ? formatTokenCount(outNum) : "—";
+      const efforts = typeof m === "object" && m.reasoning_efforts ? m.reasoning_efforts : [];
+      const caps = [];
+      if (typeof m === "object" && m.supports_images) caps.push("识图");
+      if (typeof m === "object" && (m.supports_reasoning || efforts.length)) caps.push("思考");
+      if (typeof m !== "object" || m.supports_tools !== false) caps.push("工具");
+      return `<div class="cm-model-row">
+        <div class="cm-info">
+          <code class="cm-model-id" title="${esc(mid)}">${esc(mid)}</code>
+          <span class="cm-meta">上下文 ${esc(ctx)}</span>
+          <span class="cm-meta">输出 ${esc(out)}</span>
+          <span class="cm-meta ${efforts.length ? "cm-effort" : ""}">${efforts.length ? "档位 " + esc(efforts.join("/")) : "无思考"}</span>
+          <span class="cm-meta">${esc(caps.join("·") || "—")}</span>
+        </div>
+        <button class="btn small cm-btn-edit" data-edit-model-in="${i}:${j}">编辑</button>
+        <button class="btn small danger cm-btn-del" data-del-model-in="${i}:${j}">删除</button>
+      </div>`;
+    }).join("");
+
+    return `<div class="cm-provider">
+      <div class="cm-provider-row">
+        <div class="cm-info">
+          ${chBadge(c.name, editCustomChannels)}
+          <span class="cm-url" title="${esc(c.base_url)}">${esc(c.base_url)}</span>
+          <span class="cm-key hint" title="${esc(c.api_key || '')}">[${esc(keyMask)}]</span>
+          <span class="cm-meta">${models.length} 个模型</span>
+        </div>
+        <button class="btn small cm-btn-edit" data-edit-custom="${i}">编辑</button>
+        <button class="btn small cm-btn-import" data-import-custom="${i}" title="拉取该渠道 /models 返回的模型清单，勾选后批量加入（已有的自动跳过）">导入</button>
+        <button class="btn small cm-btn-add" data-add-model-in="${i}">＋ 模型</button>
+        <button class="btn small danger cm-btn-del" data-del-custom="${i}">删除</button>
+      </div>
+      <div class="cm-models">
+        ${modelRows || '<div class="cm-model-row cm-empty-row"><span class="hint" style="margin:0">（该 Provider 还没有模型，点「＋ 模型」或「导入」）</span></div>'}
+      </div>
+    </div>`;
+  }).join("");
+
+  $("customChList").innerHTML = blocks || `<div class="hint">（暂无自定义 Provider，点下方「＋ 新增 Provider」开始配置）</div>`;
+  $("customChErr").textContent = "";
+  $("customChOk").textContent = "";
+}
+
+
+
+// ---------- 思考强度注入（设置弹层：客户端未传 reasoning_effort 时按模型注入档位） ----------
+// effRules 编辑态副本（openSettings 时从 state.reasoning_efforts 拷贝，`*` 全局默认
+// 单独走「全局默认」输入行；保存成功后由 loadState 刷新）。
+let effRules = [];
+
+// renderEffList 渲染模型档位编辑区：每条映射一个卡片区块（降级链规则卡片同款设计语言）——
+// 「映射 N」徽标 + 模型 ID（超长省略，title 悬浮看全）→ 档位 + 🗑；左对齐不撑满整行。
+function renderEffList() {
+  const rows = effRules.map((r, i) =>
+    `<div class="fb-rule-card fb-map-card">
+      <div class="fb-rule-head">
+        <span class="fb-rule-badge">映射 ${i + 1}</span>
+        <span class="fb-map-model" title="${esc(r.model)}">${esc(r.model)}</span>
+        <span class="fb-map-arrow">→</span>
+        <span class="fb-map-eff">${esc(r.effort)}</span>
+        <button class="icon-btn" data-del-eff="${i}" title="删除该映射">🗑</button>
+      </div>
+    </div>`
+  ).join("");
+  $("effList").innerHTML = rows || `<div class="fb-empty">暂无模型档位——未配置的请求不注入</div>`;
+  $("effErr").textContent = "";
+  updateEffDirty();
+}
+
+async function saveReasoningEfforts() {
+  try {
+    const efforts = {};
+    const g = $("effGlobalInput").value.trim();
+    if (g) efforts["*"] = g;
+    for (const r of effRules) efforts[r.model] = r.effort;
+    await api("/api/config/reasoning_efforts", { efforts });
+    toast("思考强度已保存（热生效）");
+    $("effErr").textContent = "";
+    state.reasoning_efforts = efforts; // 即时同步服务端态基准，提示随之熄灭
+    updateEffDirty();
+    loadState();
+  } catch (e) { $("effErr").textContent = e.message; }
+}
+
+// ---------- 设置弹层（统一配置：监听/API-Key/签到/自启/模型路由/备用上游通道） ----------
+// renderBackupProxy 回显全局备用上游通道（单一地址，空 = 关闭）。
+// 定位是**备份链路**而不是全局代理：不参与常规请求，仅渠道命中「上游地区拒绝」
+// 时在同一次请求内自动取用（决议 R57），故文案里不说「走代理」而说「重发」。
+function renderBackupProxy() {
+  const inp = $("backupProxyInput");
+  inp.value = state.backup_proxy || "";
+  inp.placeholder = "如 socks5://127.0.0.1:1080 或 http://127.0.0.1:7890（留空 = 关闭）";
+  // 生效位：后端同时回 backup_proxy（配置）与 backup_proxy_active（运行时已装载）。
+  // 两者不等 = 配置写了但进程内未生效（地址不合法/启动失败），必须让用户看见。
+  const s = $("backupProxyState");
+  s.textContent = !state.backup_proxy ? ""
+    : (state.backup_proxy_active ? "● 已生效" : "未生效（地址无效或启动失败）");
+  s.style.color = state.backup_proxy && !state.backup_proxy_active ? "var(--danger)" : (state.backup_proxy_active ? "var(--ok)" : "var(--muted)");
   $("proxyErr").textContent = "";
 }
 
@@ -1555,6 +2940,8 @@ function syncListenRisk() {
 }
 
 function openSettings() {
+  // 弹层互斥：打开设置时收起「查找模型」（#134）
+  $("modelSearchOverlay").classList.add("hidden");
   // 监听
   $("inPort").value = state.listen_port;
   $("selHost").value = state.listen_host === "127.0.0.1" ? "127.0.0.1"
@@ -1587,55 +2974,343 @@ function openSettings() {
   $("mapEditor").classList.add("hidden");
   $("mapErr").textContent = "";
   renderMapPresets(channels);
-  // 渠道代理
-  renderProxyList();
+  // 备用上游通道 + oczen 自定义 key
+  renderBackupProxy();
+  $("oczenKeyInput").value = state.oczen_api_key || ""; // 回显脱敏值；未改动则原样回传，后端按脱敏值识别为「未变」
+  $("oczenKeyInput").dataset.touched = "";
+  // 模型降级链
+  if (!lastFees) loadFees();
+  fbRules = JSON.parse(JSON.stringify(state.model_fallback || []));
+  renderFbList();
+  $("fbFromInput").value = ""; $("fbToInput").value = "";
+  // 思考强度注入（`*` 全局默认单独回显到「全局默认」行）
+  const effs = state.reasoning_efforts || {};
+  effRules = Object.entries(effs).filter(([k]) => k !== "*").map(([model, effort]) => ({ model, effort }));
+  $("effGlobalInput").value = effs["*"] || "";
+  renderEffList();
+  $("effModelInput").value = ""; $("effEffortInput").value = "";
   // 自动签到 + 开机自启 + 临期阈值
   $("chkAutostart").checked = !!state.autostart;
   $("selExpiring").value = String(state.expiring_days || 1);
-  // 挑号策略（下拉由后端下发候选，避免前后端两份枚举各写一遍）
-  const opts = state.strategy_options || [];
-  $("selStrategy").innerHTML = opts.map(o =>
-    `<option value="${o.value}" title="${esc(o.desc)}">${esc(o.label)}</option>`).join("");
-  $("selStrategy").value = state.strategy || "expire";
-  syncStrategyDesc();
-  // 成长中心自动化开关（默认全关）
-  const g = state.growth || {};
-  $("chkGrowthRedeem").checked = !!g.redeem_streak;
-  $("chkGrowthTravel").checked = !!g.travel;
-  $("selTravelLoc").value = String(g.travel_location || 1);
-  $("chkGrowthTasks").checked = !!g.tasks;
-  $("chkGrowthTasksMP").checked = !!g.tasks_include_mp;
+  $("chkLoopGuard").checked = state.loop_guard !== false; // 缺省（旧后端）按开启显示
+  $("chkBodyLog").checked = !!state.body_log;
   syncListenRisk(); // 按当前监听地址初始化警告条与必填星号
   $("settingsOverlay").classList.remove("hidden");
 }
 
 function closeSettings() {
   $("settingsOverlay").classList.add("hidden");
+  closeModelSearch();
 }
 
-// syncStrategyDesc 按当前选中的策略刷新说明文案。
-function syncStrategyDesc() {
-  const opts = state?.strategy_options || [];
-  const cur = opts.find(o => o.value === $("selStrategy").value);
-  $("strategyDesc").textContent = cur ? cur.desc : (state?.strategy_desc || "");
+// ---------- 渠道编辑弹窗（R82） ----------
+// 主列表只做一行展示，新增/修改渠道都走这个弹窗。
+// editChIdx = -1 表示新增；>=0 表示修改 editCustomChannels[editChIdx]。
+let editChIdx = -1;
+
+function openChannelEditor(idx) {
+  editChIdx = typeof idx === "number" ? idx : -1;
+  const ch = editChIdx >= 0 ? editCustomChannels[editChIdx] : null;
+  $("channelEditorTitle").textContent = ch ? "编辑渠道" : "新增渠道";
+  $("ceName").value = ch ? ch.name : "";
+  $("ceName").disabled = !!ch;      // 渠道标识是模型前缀，改名等于换路由，不允许就地改
+  $("ceURL").value = ch ? ch.base_url : "";
+  $("ceKey").value = ch ? (ch.api_key || "") : "";
+  $("ceErr").textContent = "";
+  $("channelEditorOverlay").classList.remove("hidden");
+  setTimeout(() => (ch ? $("ceURL") : $("ceName")).focus(), 50);
 }
 
-// validateProxies 收集代理输入并做本地形态校验，返回 {proxies, err}。
-function validateProxies() {
-  const proxies = {};
-  for (const inp of document.querySelectorAll(".proxy-input")) {
-    const ch = inp.dataset.ch;
-    const v = inp.value.trim();
-    if (!v) continue;
-    let u;
-    try { u = new URL(v); } catch { return [null, `渠道 ${ch} 代理地址无效：${v}`]; }
-    if (!["http:", "https:", "socks5:"].includes(u.protocol)) {
-      return [null, `渠道 ${ch} 代理协议不支持（仅 http/https/socks5）：${v}`];
-    }
-    if (!u.hostname) return [null, `渠道 ${ch} 代理缺少主机名：${v}`];
-    proxies[ch] = v;
+function closeChannelEditor() {
+  $("channelEditorOverlay").classList.add("hidden");
+  editChIdx = -1;
+}
+
+function saveChannelEditor() {
+  const name = $("ceName").value.trim().toLowerCase();
+  const url = $("ceURL").value.trim();
+  const key = $("ceKey").value.trim();
+  const fail = (m) => { $("ceErr").textContent = m; };
+  if (!name) return fail("请填入渠道标识");
+  if (!/^[a-zA-Z0-9_\-]+$/.test(name)) return fail("渠道标识仅允许字母、数字、下划线、短横线");
+  if (editChIdx < 0 && RESERVED_CHANNEL_NAMES.has(name)) return fail(`渠道标识 ${name} 与内建渠道同名，请另取一个`);
+  if (!url) return fail("请填入 Base URL");
+  if (!/^https?:\/\//i.test(url)) return fail("Base URL 必须以 http:// 或 https:// 开头");
+  if (editChIdx >= 0) {
+    Object.assign(editCustomChannels[editChIdx], { base_url: url.replace(/\/+$/, ""), api_key: key });
+  } else {
+    if (editCustomChannels.some((c) => c.name.toLowerCase() === name)) return fail(`已存在同名渠道 ${name}`);
+    editCustomChannels.push({ name, base_url: url.replace(/\/+$/, ""), api_key: key, models: [], enabled: true });
   }
-  return [proxies, ""];
+  closeChannelEditor();
+  renderCustomChList();
+  $("customChOk").textContent = "已更新，点击「保存全部配置」生效";
+  $("customChErr").textContent = "";
+}
+
+// ---------- 模型管理弹窗（R82） ----------
+// 一行一个模型；新增/修改走 modelEditorOverlay（第三层），删除就地生效。
+let mgrChIdx = -1;
+let editModelIdx = -1;
+
+function renderModelManager() {
+  const ch = editCustomChannels[mgrChIdx];
+  if (!ch) return;
+  const models = ch.models || [];
+  $("modelManagerTitle").textContent = `模型管理 — ${ch.name}（${models.length}）`;
+  $("modelMgrEmpty").style.display = models.length ? "none" : "";
+  $("modelMgrList").innerHTML = models.map((m, j) => {
+    const mid = typeof m === "string" ? m : m.id;
+    const ctxNum = typeof m === "object" ? parseTokens(m.context_window, 0) : 0;
+    const outNum = typeof m === "object" ? parseTokens(m.max_tokens, 0) : 0;
+    const ctx = ctxNum ? formatTokenCount(ctxNum) : "—";
+    const out = outNum ? formatTokenCount(outNum) : "—";
+    const efforts = typeof m === "object" && m.reasoning_efforts ? m.reasoning_efforts : [];
+    const caps = [];
+    if (typeof m === "object" && m.supports_images) caps.push("识图");
+    if (typeof m === "object" && (m.supports_reasoning || efforts.length)) caps.push("思考");
+    if (typeof m !== "object" || m.supports_tools !== false) caps.push("工具");
+    const effTxt = efforts.length ? `思考 ${efforts.join("/")}` : "";
+    return `<div class="model-mgr-row">
+      <code title="${esc(mid)}">${esc(mid)}</code>
+      <span class="mm-meta">${esc(ctx)} / ${esc(out)}</span>
+      ${effTxt ? `<span class="tag ok">${esc(effTxt)}</span>` : ""}
+      <span class="mm-meta">${esc(caps.join("·") || "—")}</span>
+      <button class="btn small" data-edit-model="${j}">编辑</button>
+      <button class="btn small danger" data-del-model="${j}" title="移除该模型">删除</button>
+    </div>`;
+  }).join("");
+}
+
+function openModelManager(idx) {
+  mgrChIdx = idx;
+  renderModelManager();
+  $("modelManagerOverlay").classList.remove("hidden");
+}
+
+function closeModelManager() {
+  $("modelManagerOverlay").classList.add("hidden");
+  mgrChIdx = -1;
+}
+
+function openModelEditor(modelIdx) {
+  const ch = editCustomChannels[mgrChIdx];
+  if (!ch) return;
+  editModelIdx = typeof modelIdx === "number" ? modelIdx : -1;
+  const m = editModelIdx >= 0 ? ch.models[editModelIdx] : null;
+  const o = typeof m === "object" && m ? m : {};
+  $("modelEditorTitle").textContent = m ? "编辑模型" : "新增模型";
+  $("meId").value = m ? (typeof m === "string" ? m : m.id) : "";
+  $("meCtx").value = o.context_window ? formatTokenCount(parseTokens(o.context_window, 0)) : "1M";
+  $("meOut").value = o.max_tokens ? formatTokenCount(parseTokens(o.max_tokens, 0)) : "64k";
+  $("meEff").value = (o.reasoning_efforts || []).join(", ");
+  $("meImg").checked = !!o.supports_images;
+  $("meRsn").checked = !!o.supports_reasoning || (o.reasoning_efforts || []).length > 0;
+  $("meTools").checked = typeof m === "string" ? true : o.supports_tools !== false;
+  $("meErr").textContent = "";
+  $("modelEditorOverlay").classList.remove("hidden");
+  setTimeout(() => $("meId").focus(), 50);
+}
+
+function closeModelEditor() {
+  $("modelEditorOverlay").classList.add("hidden");
+  editModelIdx = -1;
+  // 从列表直接点 chip 进来时模型管理弹窗是关着的，关掉编辑弹窗后复位 mgrChIdx，
+  // 否则后续「导入」会误用这个残留渠道。
+  if ($("modelManagerOverlay").classList.contains("hidden")) mgrChIdx = -1;
+}
+
+function saveModelEditor() {
+  const ch = editCustomChannels[mgrChIdx];
+  if (!ch) return;
+  const id = $("meId").value.trim();
+  if (!id) return ($("meErr").textContent = "请填入模型 ID");
+  ch.models = ch.models || [];
+  if (ch.models.some((m, j) => j !== editModelIdx && (typeof m === "string" ? m : m.id) === id)) {
+    return ($("meErr").textContent = `该渠道下已存在模型 ${id}`);
+  }
+  // 思考档位：逗号/顿号/空格分隔都接受，去空去重保序
+  const efforts = $("meEff").value.split(/[,，、\s]+/).map((x) => x.trim()).filter(Boolean)
+    .filter((x, k, arr) => arr.indexOf(x) === k);
+  const rec = {
+    id,
+    context_window: parseTokens($("meCtx").value, 0),
+    max_tokens: parseTokens($("meOut").value, 0),
+    supports_images: $("meImg").checked,
+    supports_reasoning: $("meRsn").checked || efforts.length > 0,
+    supports_tools: $("meTools").checked,
+    reasoning_efforts: efforts,
+  };
+  if (efforts.length) rec.default_reasoning_effort = efforts[0];
+  if (editModelIdx >= 0) ch.models[editModelIdx] = rec; else ch.models.push(rec);
+  closeModelEditor();
+  renderModelManager();
+  renderCustomChList();
+  $("customChOk").textContent = "已更新，点击「保存全部配置」生效";
+  $("customChErr").textContent = "";
+}
+
+// ---------- 自定义模型弹窗（R85） ----------
+// 设置里只留一个「配置自定义模型」按钮，实际增删改全在这个弹窗里。
+// 弹窗独立的好处：不用挤在设置的一长串 section 里滚来滚去，且宽度可单独给足。
+function openCustomModels() {
+  editCustomChannels = JSON.parse(JSON.stringify(state.custom_channels || []));
+  renderCustomChList();
+  $("customModelsOverlay").classList.remove("hidden");
+}
+
+function closeCustomModels() {
+  $("customModelsOverlay").classList.add("hidden");
+}
+
+async function saveCustomChannels() {
+  try {
+    await api("/api/config/custom_channels", { channels: editCustomChannels });
+    toast("自定义模型已保存（热生效）");
+    $("customChErr").textContent = "";
+    $("customChOk").textContent = "已保存并立即生效";
+    loadState();
+  } catch (e) {
+    $("customChErr").textContent = e.message;
+    $("customChOk").textContent = "";
+  }
+}
+
+// ---------- 模型一键导入（R81） ----------
+// 背景：反代/官方 API 的 /models 端点通常能列出全部可用模型，手填模型 ID 既慢又容易
+// 打错字（打错的模型名不会报错，只在真正请求时 404）。这里拉一次 /models、勾选、批量加入。
+//
+// 默认参数取「保守可用」而不是「最优」：上下文 1M / 输出 64k / 三能力全开，与
+// 手填输入框的默认值一致（用户要精确值可再改表格）。导入只负责把模型**加进编辑态**，
+// 仍需点「保存全部配置」才落盘 —— 与既有「添加模型」交互一致，不引入新的隐式写入。
+let importCtx = { chIdx: -1, models: [] };
+
+// visibleImportIdx 当前筛选条件下可见的模型下标（全选/全不选只作用于可见行，
+// 与「所见即所选」一致；否则筛了 4 条点全选会把 100 条全勾上，用户看不出来）。
+function visibleImportIdx() {
+  const kw = $("importFilter").value.trim().toLowerCase();
+  const out = [];
+  importCtx.models.forEach((m, i) => {
+    if (!kw || m.id.toLowerCase().includes(kw)) out.push(i);
+  });
+  return out;
+}
+
+function renderImportList() {
+  const kw = $("importFilter").value.trim().toLowerCase();
+  const rows = importCtx.models.map((m, i) => {
+    if (kw && !m.id.toLowerCase().includes(kw)) return "";
+    // 用 div + 显式 for/id 关联，而不是 label 包裹 input：
+    // label 包裹 input 时点 label 会「先由 label 转发、再被冒泡处理」双重切换
+    // （实测：点 label 反而把刚勾上的取消掉）。显式 for 只触发一次。
+    const cid = `imp-${i}`;
+    return `<div class="import-row"><input type="checkbox" id="${cid}" data-import-pick="${i}"${m.checked ? " checked" : ""}${m.exists ? " disabled" : ""}>` +
+      `<label class="import-name" for="${cid}"><code>${esc(m.id)}</code></label>` +
+      (m.exists ? '<span class="tag neutral" style="margin-left:auto">已存在</span>' : "") +
+      `</div>`;
+  }).join("");
+  $("importList").innerHTML = rows || '<div class="hint">（没有匹配的模型）</div>';
+}
+
+async function openModelImport(chIdx) {
+  const ch = editCustomChannels[chIdx];
+  if (!ch) return;
+  importCtx = { chIdx, models: [] };
+  $("importHint").textContent = `从 [${ch.name}] 的 /models 拉取…`;
+  $("importErr").textContent = "";
+  $("importFilter").value = "";
+  $("importList").innerHTML = '<div class="hint">加载中…</div>';
+  $("modelImportOverlay").classList.remove("hidden");
+  try {
+    const res = await api("/api/config/custom_channel_test", { name: ch.name, base_url: ch.base_url, api_key: ch.api_key });
+    if (!res.ok) {
+      $("importErr").textContent = `拉取失败：${res.error || "上游未返回模型列表"}`;
+      $("importList").innerHTML = "";
+      $("importHint").textContent = "";
+      return;
+    }
+    const have = new Set((ch.models || []).map((m) => (typeof m === "string" ? m : m.id)));
+    const ids = (res.models || []).filter((id) => id);
+    importCtx.models = ids.map((id) => ({ id, exists: have.has(id), checked: !have.has(id) }));
+    const fresh = importCtx.models.filter((m) => !m.exists).length;
+    $("importHint").textContent = `上游共 ${ids.length} 个模型，其中 ${fresh} 个未添加（已存在的不可勾选）。勾选后点「导入选中」，再点「保存全部配置」生效。`;
+    renderImportList();
+  } catch (e) {
+    $("importErr").textContent = `拉取失败：${e.message}`;
+    $("importList").innerHTML = "";
+  }
+}
+
+function closeModelImport() {
+  $("modelImportOverlay").classList.add("hidden");
+  importCtx = { chIdx: -1, models: [] };
+}
+
+function confirmModelImport() {
+  const ch = editCustomChannels[importCtx.chIdx];
+  if (!ch) return closeModelImport();
+  ch.models = ch.models || [];
+  let added = 0;
+  for (const m of importCtx.models) {
+    if (!m.checked || m.exists) continue;
+    // 与「添加模型」按钮同款默认值（见 custom-model-add-row 的 input 默认值）
+    ch.models.push({ id: m.id, context_window: 1000000, max_tokens: 64000,
+      supports_images: true, supports_reasoning: true, supports_tools: true, reasoning_efforts: [] });
+    added++;
+  }
+  closeModelImport();
+  renderCustomChList();
+  $("customChOk").textContent = added
+    ? `已导入 ${added} 个模型，点击「保存全部配置」生效`
+    : "没有新增模型（选中的都已存在）";
+  $("customChErr").textContent = "";
+}
+
+// validateBackupProxy 校验备用上游通道地址，返回 [url, err]（空串合法 = 关闭）。
+// 判据与后端 backuplink.Parse 同源：仅 http/https/socks5，且必须有主机名。
+function validateBackupProxy() {
+  const v = $("backupProxyInput").value.trim();
+  if (!v) return ["", ""];
+  let u;
+  try { u = new URL(v); } catch { return [null, `备用代理地址无效：${v}`]; }
+  if (!["http:", "https:", "socks5:"].includes(u.protocol)) {
+    return [null, `备用代理协议不支持（仅 http/https/socks5）：${v}`];
+  }
+  if (!u.hostname) return [null, `备用代理缺少主机名：${v}`];
+  return [v, ""];
+}
+
+// testOczenKey 「测试」按钮：用输入框当前的候选 key（含脱敏值/空）调后端实测。
+// 后端逻辑：候选 key 临时写入渠道 client → big-pickle 发最小对话 → 200/429 均算通过
+// （200 = 配额正常；429 = 连通但匿名共享配额限流，属预期现象）；测试后恢复配置原值。
+// 与真实对话同源（issue #117）：直连被地区拒时后端会自动改走备用通道，
+// via_backup 标出答复来自哪个出口——否则用户配了代理点测试仍看到 403 会误以为功能没生效。
+async function testOczenKey() {
+  const btn = $("btnOczenTest");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = "测试中…";
+  $("proxyErr").textContent = "";
+  try {
+    let k = $("oczenKeyInput").value.trim();
+    if (k.includes("…")) k = ""; // 脱敏形态 = 未改动，用当前配置值测
+    const r = await api("/api/config/oczen_test", { api_key: k });
+    const via = r.via_backup ? "经备用通道" : "直连";
+    if (r.ok) {
+      toast(r.status === 200 ? `✓ OpenCodeZen 凭证可用（200，${via}）` : `✓ 连通正常（429 匿名限流，属预期，${via}）`);
+    } else {
+      const brief = (r.body || r.error || "").slice(0, 90).replace(/\s+/g, " ");
+      // 403 且经直连 = 最可能是地区限制，而备用通道未配置/未生效：给出可行动提示
+      const hint = (!r.via_backup && r.status === 403) ? "（未走备用通道；若已配代理仍为直连，说明本次不是地区拒绝或备用链路拨不动，详见日志）" : "";
+      toast(`✗ 测试失败 HTTP ${r.status}${hint}：${brief}`);
+    }
+  } catch (e) {
+    toast("✗ 测试失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = old;
+  }
 }
 
 async function saveSettings() {
@@ -1658,12 +3333,19 @@ async function saveSettings() {
     } catch (e) { toast(e.message); closeSettings(); showLogin("管理密码已变更，请重新登录"); return; }
   }
 
-  // 2) 代理（先本地校验，失败阻断保存）
-  const [proxies, perr] = validateProxies();
+  // 2) 备用上游通道（先本地校验，失败阻断保存）+ oczen key（仅在用户改动过时提交，避免把脱敏回显值存回）
+  const [proxy, perr] = validateBackupProxy();
   if (perr) { $("proxyErr").textContent = perr; toast(perr); return; }
-  const body = { proxies };
+  const body = { proxy };
+  const kIn = $("oczenKeyInput");
+  if (kIn.dataset.touched === "1") {
+    let k = kIn.value.trim();
+    // 值仍是脱敏形态（含 …）则视为未修改，保持服务端现值
+    if (k && k.includes("…")) k = undefined;
+    if (k !== undefined) body.oczen_api_key = k; // undefined 时不携带字段 = 不改动；空串 = 清除回匿名
+  }
   try {
-    await api("/api/config/proxies", body);
+    await api("/api/config/proxy", body);
   } catch (e) { toast(e.message); return; }
 
   // 3) 模型映射：优先读编辑器；编辑器从未展开过则用原值（保证「只改监听/渠道不碰映射」）
@@ -1687,27 +3369,15 @@ async function saveSettings() {
     } catch (e) { toast(e.message); return; }
   }
 
-  // 4.5) 挑号策略（热更新到各渠道账号池，无需重启）
-  const strategy = $("selStrategy").value;
-  if (strategy && strategy !== (state.strategy || "expire")) {
+  // 4.5) 思考链防癫开关（独立端点即时生效）
+  const loopGuardOn = $("chkLoopGuard").checked;
+  if (loopGuardOn !== (state.loop_guard !== false)) {
     try {
-      await api("/api/config/strategy", { strategy });
+      await api("/api/config/loop_guard", { on: loopGuardOn });
     } catch (e) { toast(e.message); return; }
   }
 
-  // 5) 成长中心自动化开关（四项，默认全关；保存后热生效，无需重启）
-  const growthBody = {
-    redeem_streak: $("chkGrowthRedeem").checked,
-    travel: $("chkGrowthTravel").checked,
-    travel_location: parseInt($("selTravelLoc").value, 10) || 1,
-    tasks: $("chkGrowthTasks").checked,
-    tasks_include_mp: $("chkGrowthTasksMP").checked,
-  };
-  try {
-    await api("/api/config/growth", growthBody);
-  } catch (e) { toast(e.message); return; }
-
-  // 6) API-Key（最后保存：改 Key 可能影响当前会话的后续请求）
+  // 5) API-Key（最后保存：改 Key 可能影响当前会话的后续请求）
   try {
     await api("/api/config/api_key", { key: $("keyInput").value.trim() });
   } catch (e) { toast(e.message); return; }
@@ -1734,6 +3404,8 @@ async function clearAdminPassword() {
 let renameUid = null;
 
 function openRename(uid, currentName) {
+  if (uid === "oczen-anon") { toast("OpenCodeZen 匿名通道账号不可改名"); return; }
+  if (uid === "kilo-anonymous") { toast("Kilo 免费池账号不可改名"); return; }
   renameUid = uid;
   $("rnUid").textContent = shortUid(uid);
   $("rnInput").value = currentName === shortUid(uid) ? "" : (currentName || "");
@@ -1892,21 +3564,47 @@ function bind() {
   $("btnGLMSubmit").onclick = submitGLMToken;
   $("btnGLMCancel").onclick = cancelGLMLogin;
   $("btnGLMToggleManual").onclick = () => $("glmManual").classList.toggle("hidden");
+  $("btnAddCline").onclick = () => promptLogin("cline");
+  $("btnClineSubmit").onclick = submitClineKey;
+  $("btnClineCancel").onclick = () => $("clineOverlay").classList.add("hidden");
+  $("btnAddOfficeAce").onclick = () => promptLogin("officeace");
+  $("btnAddMiniMax").onclick = () => promptLogin("minimax");
+  $("btnAddLobsterAI").onclick = () => promptLogin("lobsterai");
+  $("btnAddZCode").onclick = () => promptLogin("zcode");
+  $("btnAddGemini").onclick = () => promptLogin("gemini");
+  $("btnAddCodeArts").onclick = () => promptLogin("codearts");
   $("btnCheckinAll").onclick = checkinAll;
   $("btnRefreshAll").onclick = refreshAll;
   $("btnTasksAll").onclick = () => runTasks("");
+  $("btnClaimComp").onclick = () => claimCompensation("");
   $("btnAddTime").onclick = addTime;
   $("btnCopyUrl").onclick = copyUrl;
+  $("btnSubmitCallback").onclick = submitCallback;
   $("btnCancelLogin").onclick = cancelLogin;
   $("btnRefreshFees").onclick = refreshFees;
-  $("btnExportModels").onclick = exportModelsJson;
-  $("btnShowAllModels").onclick = toggleShowAllModels;
-  $("feeSearch").addEventListener("input", applyFeeSearch);
-  $("btnMjConfirm").onclick = confirmModelsJson;
-  $("btnMjCancel").onclick = closeModelsJson;
-  $("modelsJsonOverlay").onclick = (e) => { if (e.target === $("modelsJsonOverlay")) closeModelsJson(); };
+  // 模型查找面板（纯前端）：入口按钮 + 关闭 + 输入即过滤 + 结果点击复制完整 ID。
+  $("btnModelSearch").onclick = openModelSearch;
+  $("btnModelSearchClose").onclick = closeModelSearch;
+  // 设置弹层内「模型降级链 / 思考强度」标题右侧的查找入口：与首页共用同一套弹层与渲染，
+  // 故只做入口接线（这些按钮在动态渲染的配置区之外，属静态 DOM，用属性选择器统一绑定）。
+  for (const el of document.querySelectorAll("[data-model-search]")) {
+    el.onclick = openModelSearch;
+  }
+  $("modelSearchOverlay").onclick = (e) => { if (e.target === $("modelSearchOverlay")) closeModelSearch(); };
+  $("modelSearchOverlay").onkeydown = (e) => { if (e.key === "Escape") closeModelSearch(); };
+  $("modelSearchInput").oninput = (e) => renderModelSearch(e.target.value);
+  $("modelSearchInput").onkeydown = (e) => { if (e.key === "Escape") closeModelSearch(); };
+  $("modelSearchList").onclick = (e) => {
+    const row = e.target.closest(".ms-row");
+    if (row) copyText(row.dataset.mid, "模型 ID");
+  };
+  $("modelSearchList").onkeydown = (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const row = e.target.closest(".ms-row");
+    if (row) { e.preventDefault(); copyText(row.dataset.mid, "模型 ID"); }
+  };
   $("chkAutostart").onchange = toggleAutostart;
-  $("selStrategy").onchange = syncStrategyDesc;
+  $("chkBodyLog").onchange = toggleBodyLog;
   $("btnAdminLogout").onclick = () => logout();
   $("btnClearAdminPass").onclick = clearAdminPassword;
   $("btnAdminLogin").onclick = submitLogin;
@@ -1917,8 +3615,8 @@ function bind() {
     copyText(v, "OpenAI 接口地址");
   };
   $("apiKeyDisplay").onclick = () => {
-    const v = $("apiKeyDisplay").querySelector(".val").textContent;
-    if (v === "（无鉴权）") { toast("当前未设置 API-Key"); return; }
+    const v = $("apiKeyDisplay").dataset.key;
+    if (v === undefined || v === "") { toast("当前未设置 API-Key"); return; }
     copyText(v, "API-Key");
   };
   // 顶栏齿轮进入统一设置（点击地址/Key 文本仍为复制）
@@ -1946,10 +3644,290 @@ function bind() {
   $("btnRenameCancel").onclick = closeRename;
   $("rnInput").addEventListener("keydown", (e) => { if (e.key === "Enter") saveRename(); });
 
+  // 模型降级链：添加规则 / 保存 / 列表内事件委托（删规则、删备胎、追加备胎、回车添加、拖拽排序）
+  $("btnFbAdd").onclick = () => {
+    const from = $("fbFromInput").value.trim();
+    if (!/^[^/]+\/.+/.test(from)) { $("fbErr").textContent = "主力模型ID 需为 channel/model 形式（如 workbuddyai/deepseek-v4.1-flash）"; return; }
+    if (fbRules.some((r) => r.from === from)) { $("fbErr").textContent = `主模型 ${from} 已有规则（每个主模型只允许一条）`; return; }
+    const [tos, err] = parseModelList($("fbToInput").value);
+    if (err) { $("fbErr").textContent = err; return; }
+    if (tos.length === 0) { $("fbErr").textContent = "至少填一个备胎模型ID"; return; }
+    // 互斥预过滤：剔除已有规则主力 + 新 from 自身（renderFbList 兜底同规则，此处前置给即时反馈）
+    const fsx = fbFromSet(); fsx[from] = true;
+    const kept = tos.filter((t) => !fsx[t]);
+    if (kept.length === 0) { $("fbErr").textContent = "备胎均与主力模型互斥（含新主力自身），请更换备胎"; return; }
+    if (kept.length < tos.length) toast(`已剔除 ${tos.length - kept.length} 个与主力模型互斥的备胎`);
+    fbRules.push({ from, to: kept });
+    $("fbFromInput").value = ""; $("fbToInput").value = "";
+    renderFbList(); // 内部先 fbSanitize：互斥兜底（预过滤后此处不再剔除）
+  };
+  $("btnFbSave").onclick = saveModelFallback;
+  $("fbList").addEventListener("click", async (e) => {
+    const addBtn = e.target.closest("[data-add-to]");
+    if (addBtn) {
+      const i = +addBtn.dataset.addTo;
+      const inp = document.querySelector(`.fb-to-add[data-add-idx="${i}"]`);
+      const [tos, err] = parseModelList(inp && inp.value);
+      if (err) { $("fbErr").textContent = err; return; }
+      if (tos.length === 0) { $("fbErr").textContent = "先在输入框填备胎模型ID 再点 ＋"; return; }
+      fbRules[i].to.push(...tos.filter((t) => !fbFromSet()[t] && !fbRules[i].to.includes(t))); // 主力ID全局排除
+      renderFbList();
+      return;
+    }
+    const delTo = e.target.closest("[data-del-to]");
+    if (delTo) {
+      const [i, j] = delTo.dataset.delTo.split(":").map(Number);
+      fbRules[i].to.splice(j, 1);
+      renderFbList();
+      return;
+    }
+    const delRule = e.target.closest("[data-del-rule]");
+    if (delRule) {
+      fbRules.splice(+delRule.dataset.delRule, 1);
+      renderFbList();
+    }
+  });
+  // 行内备胎输入框回车 = 追加到该规则（事件委托 keydown）；主模型输入框回车 = blur 确认。
+  // combobox 的 Enter 在下拉开着时已被其自身 stopPropagation 消化，走到这里的必是「下拉关闭态」。
+  $("fbList").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    if (e.target.classList.contains("fb-from-edit")) { e.target.blur(); return; }
+    if (!e.target.classList.contains("fb-to-add")) return;
+    const i = +e.target.dataset.addIdx;
+    const [tos, err] = parseModelList(e.target.value);
+    if (err) { $("fbErr").textContent = err; return; }
+    if (tos.length === 0) return;
+    fbRules[i].to.push(...tos.filter((t) => !fbFromSet()[t] && !fbRules[i].to.includes(t))); // 主力ID全局排除
+    renderFbList();
+  });
+  // 行内主模型 ID 编辑：change（失焦/回车后 blur）提交——形态校验 + 主模型唯一性校验，
+  // 失败回滚输入框；成功写回 fbRules 并滤掉与新 from 自环的备胎，重渲染刷新 title。
+  $("fbList").addEventListener("change", (e) => {
+    if (!e.target.classList.contains("fb-from-edit")) return;
+    const i = +e.target.dataset.editIdx;
+    const from = String(e.target.value || "").trim();
+    const cur = fbRules[i].from;
+    if (!from || from === cur) { e.target.value = cur; return; }
+    if (!/^[^/]+\/.+/.test(from)) { $("fbErr").textContent = `主力模型ID ${from} 需为 channel/model 形式（如 workbuddyai/deepseek-v4.1-flash）`; e.target.value = cur; return; }
+    if (fbRules.some((r, k) => k !== i && r.from === from)) { $("fbErr").textContent = `主模型 ${from} 已有规则（每个主模型只允许一条）`; e.target.value = cur; return; }
+    fbRules[i].from = from;
+    fbRules[i].to = fbRules[i].to.filter((t) => t !== from);
+    renderFbList();
+  });
+  // 备胎 chip 拖拽排序（委托在 #fbList；仅同规则内拖动）。drop 后就地 splice fbRules[i].to
+  // 并重渲染（chip 序号随之刷新）；只改编辑态，点「保存降级链」才落盘。
+  // 从 × 删除链接起手不拖（chip 内 a[data-del-to] 命中时跳过 dragstart）。
+  let fbDragSrc = null; // { i, j, el }
+  $("fbList").addEventListener("dragstart", (e) => {
+    const chip = e.target.closest(".fb-to-chip");
+    if (!chip || e.target.closest("[data-del-to]")) { e.preventDefault(); return; }
+    const [i, j] = chip.dataset.chip.split(":").map(Number);
+    fbDragSrc = { i, j, el: chip };
+    chip.classList.add("dragging");
+    try { e.dataTransfer.setData("text/plain", "x"); e.dataTransfer.effectAllowed = "move"; } catch (err) {}
+  });
+  $("fbList").addEventListener("dragover", (e) => {
+    if (!fbDragSrc) return;
+    e.preventDefault();
+    const chip = e.target.closest(".fb-to-chip");
+    // 清掉上一轮指示条，再按指针相对 chip 左右半标记插入位
+    document.querySelectorAll(".fb-to-chip.drop-before,.fb-to-chip.drop-after").forEach((c) => c.classList.remove("drop-before", "drop-after"));
+    if (!chip || chip === fbDragSrc.el) return;
+    const r = chip.getBoundingClientRect();
+    chip.classList.add(e.clientX - r.left < r.width / 2 ? "drop-before" : "drop-after");
+  });
+  $("fbList").addEventListener("drop", (e) => {
+    e.preventDefault();
+    const chip = e.target.closest(".fb-to-chip");
+    const mark = document.querySelector(".fb-to-chip.drop-before, .fb-to-chip.drop-after");
+    if (chip && mark && fbDragSrc && chip.dataset.chip && fbDragSrc.el.dataset.chip) {
+      const [si, sj] = fbDragSrc.el.dataset.chip.split(":").map(Number);
+      const [ti] = chip.dataset.chip.split(":").map(Number);
+      if (si === ti) { // 仅同规则内拖动
+        const before = mark.classList.contains("drop-before");
+        let dj = +chip.dataset.chip.split(":")[1] + (before ? 0 : 1);
+        const arr = fbRules[si].to;
+        const [moved] = arr.splice(sj, 1);
+        if (dj > sj) dj--; // 移除原位后修正目标下标
+        arr.splice(dj, 0, moved);
+        renderFbList();
+        toast("顺序已调整（序号已同步），点「保存降级链」生效");
+      }
+    }
+    document.querySelectorAll(".fb-to-chip.drop-before,.fb-to-chip.drop-after").forEach((c) => c.classList.remove("drop-before", "drop-after"));
+    fbDragSrc = null;
+  });
+  $("fbList").addEventListener("dragend", () => {
+    if (fbDragSrc) fbDragSrc.el.classList.remove("dragging");
+    fbDragSrc = null;
+    document.querySelectorAll(".fb-to-chip.drop-before,.fb-to-chip.drop-after").forEach((c) => c.classList.remove("drop-before", "drop-after"));
+  });
+
+  // 思考强度：添加映射 / 保存 / 列表内删除 / 回车添加
+  $("btnEffAdd").onclick = () => {
+    const model = $("effModelInput").value.trim();
+    const effort = $("effEffortInput").value.trim();
+    if (!model) { $("effErr").textContent = "模型ID 不能为空（全局默认请在上方「全局默认」行填）"; return; }
+    if (model === "*") { $("effErr").textContent = "* 是全局默认专用键，请在上方「全局默认」行填"; return; }
+    if (!effort) { $("effErr").textContent = "思考档位不能为空"; return; }
+    if (effRules.some((r) => r.model === model)) { $("effErr").textContent = `模型 ${model} 已有档位（每个模型只允许一条）`; return; }
+    effRules.push({ model, effort });
+    $("effModelInput").value = ""; $("effEffortInput").value = "";
+    renderEffList();
+  };
+  $("btnEffSave").onclick = saveReasoningEfforts;
+  $("effList").addEventListener("click", (e) => {
+    const del = e.target.closest("[data-del-eff]");
+    if (del) {
+      effRules.splice(+del.dataset.delEff, 1);
+      renderEffList();
+    }
+  });
+
+  // 配置区模糊搜索下拉接线（静态输入框一次性挂；行内输入框由 attachFbPickers 每轮重挂）。
+  // 回车链：底部主力框 → 跳备胎框；备胎框 → 添加规则；映射模型框 → 跳档位框；档位框 → 添加映射。
+  attachModelPicker($("fbFromInput"), {
+    excludeSet: () => fbFromSet(), // 已配置的主力从候选隐藏（重复由下方添加校验兜底），与备胎框行为对齐
+    enterAction: () => $("fbToInput").focus(),
+  });
+  attachModelPicker($("fbToInput"), {
+    stayOpen: true, multiAccum: true, // 累积多选：点选逐个逗号追加，末段继续搜
+    excludeSet: () => fbFromSet(), // 已配置的主力模型ID从备胎候选隐藏（实时取，主力变更即同步）
+    enterAction: () => $("btnFbAdd").onclick(),
+  });
+  attachModelPicker($("effModelInput"), { enterAction: () => $("effEffortInput").focus() });
+  attachEffortPicker($("effGlobalInput"));
+  attachEffortPicker($("effEffortInput"), { enterAction: () => $("btnEffAdd").onclick() });
+  // 全局默认框手输/选择后即时刷新未保存提示（effRules 变化经 renderEffList 已覆盖）
+  $("effGlobalInput").addEventListener("input", updateEffDirty);
+
+  // 自定义渠道（R66）：测试、停用/启用、删除、添加、保存
+  $("customChList").addEventListener("click", async (e) => {
+    const editChBtn = e.target.closest("[data-edit-custom]");
+    if (editChBtn) {
+      openChannelEditor(+editChBtn.dataset.editCustom);
+      return;
+    }
+    // 模型行：编辑 / 删除（R85 起模型各占一行，不再有 chip）
+    const editModelBtn = e.target.closest("[data-edit-model-in]");
+    if (editModelBtn) {
+      const [ci, mi] = editModelBtn.dataset.editModelIn.split(":").map(Number);
+      mgrChIdx = ci;                      // 模型编辑弹窗依赖 mgrChIdx 定位渠道
+      openModelEditor(mi);
+      return;
+    }
+    const delModelBtn = e.target.closest("[data-del-model-in]");
+    if (delModelBtn) {
+      const [ci, mi] = delModelBtn.dataset.delModelIn.split(":").map(Number);
+      const ch = editCustomChannels[ci];
+      if (ch && ch.models && ch.models[mi] !== undefined) {
+        ch.models.splice(mi, 1);
+        renderCustomChList();
+        $("customChOk").textContent = "已移除模型，点「保存」生效";
+      }
+      return;
+    }
+    // Provider 行：新增模型
+    const addModelBtn = e.target.closest("[data-add-model-in]");
+    if (addModelBtn) {
+      mgrChIdx = +addModelBtn.dataset.addModelIn;
+      openModelEditor(-1);
+      return;
+    }
+    const importBtn = e.target.closest("[data-import-custom]");
+    if (importBtn) {
+      openModelImport(+importBtn.dataset.importCustom);
+      return;
+    }
+    const delBtn = e.target.closest("[data-del-custom]");
+    if (delBtn) {
+      const idx = +delBtn.dataset.delCustom;
+      editCustomChannels.splice(idx, 1);
+      renderCustomChList();
+      return;
+    }
+  });
+
+  // R82：新增渠道走独立弹窗（不再依赖底部输入行）
+  $("btnCustomAdd").onclick = () => openChannelEditor(-1);
+  // ---- 自定义模型弹窗（R85）----
+  $("btnOpenCustomModels").onclick = () => openCustomModels();
+  $("btnCustomClose").onclick = () => closeCustomModels();
+  $("btnCustomSave").onclick = saveCustomChannels;
+  $("customModelsOverlay").onclick = (e) => { if (e.target === $("customModelsOverlay")) closeCustomModels(); };
+
+
+  // ---- 渠道编辑弹窗（R82） ----
+  $("btnCeCancel").onclick = () => closeChannelEditor();
+  $("btnCeSave").onclick = () => saveChannelEditor();
+  $("channelEditorOverlay").onclick = (e) => { if (e.target === $("channelEditorOverlay")) closeChannelEditor(); };
+  $("ceURL").onkeydown = (e) => { if (e.key === "Enter") saveChannelEditor(); };
+
+  // ---- 模型管理弹窗（R82） ----
+  $("btnMgrClose").onclick = () => closeModelManager();
+  $("modelManagerOverlay").onclick = (e) => { if (e.target === $("modelManagerOverlay")) closeModelManager(); };
+  $("btnMgrAdd").onclick = () => openModelEditor(-1);
+  $("btnMgrImport").onclick = () => { if (mgrChIdx >= 0) openModelImport(mgrChIdx); };
+  $("modelMgrList").addEventListener("click", (e) => {
+    const editBtn = e.target.closest("[data-edit-model]");
+    if (editBtn) return openModelEditor(+editBtn.dataset.editModel);
+    const delLink = e.target.closest("[data-del-model]");
+    if (delLink) {
+      const ch = editCustomChannels[mgrChIdx];
+      const j = +delLink.dataset.delModel;
+      if (ch && ch.models && ch.models[j] !== undefined) {
+        ch.models.splice(j, 1);
+        renderModelManager();
+        renderCustomChList();
+      }
+      return;
+    }
+  });
+
+  // ---- 单个模型编辑弹窗（R82） ----
+  $("btnMeCancel").onclick = () => closeModelEditor();
+  $("btnMeSave").onclick = () => saveModelEditor();
+  $("modelEditorOverlay").onclick = (e) => { if (e.target === $("modelEditorOverlay")) closeModelEditor(); };
+  $("meId").onkeydown = (e) => { if (e.key === "Enter") saveModelEditor(); };
+
   // 点击弹层空白处关闭
   $("settingsOverlay").onclick = (e) => { if (e.target === $("settingsOverlay")) closeSettings(); };
+
+  // ---- 模型导入弹层（R81） ----
+  $("btnImportCancel").onclick = () => closeModelImport();
+  $("btnImportConfirm").onclick = () => confirmModelImport();
+  $("modelImportOverlay").onclick = (e) => { if (e.target === $("modelImportOverlay")) closeModelImport(); };
+  $("importFilter").oninput = () => renderImportList();
+  // 全选/全不选：只同步「已渲染的 checkbox」的 checked，**不重建列表**。
+  // 重建会让用户手上/事件队列里的 DOM 节点变成孤儿——change 事件落到已废弃节点上，
+  // importCtx 收不到更新（实测：全不选后再手动勾选，models 里始终是 0）。
+  const syncChecks = () => {
+    document.querySelectorAll("#importList [data-import-pick]").forEach((cb) => {
+      const i = +cb.dataset.importPick;
+      if (importCtx.models[i]) cb.checked = importCtx.models[i].checked;
+    });
+  };
+  $("btnImportAll").onclick = () => {
+    for (const i of visibleImportIdx()) if (!importCtx.models[i].exists) importCtx.models[i].checked = true;
+    syncChecks();
+  };
+  $("btnImportNone").onclick = () => {
+    for (const i of visibleImportIdx()) importCtx.models[i].checked = false;
+    syncChecks();
+  };
+  // 用事件委托绑定在容器上（列表会整块重建，绑在元素上会随重建丢失）
+  $("importList").onchange = (e) => {
+    const cb = e.target.closest("[data-import-pick]");
+    if (!cb) return;
+    const i = +cb.dataset.importPick;
+    if (importCtx.models[i]) importCtx.models[i].checked = cb.checked;
+  };
   $("renameOverlay").onclick = (e) => { if (e.target === $("renameOverlay")) closeRename(); };
   $("helpOverlay").onclick = (e) => { if (e.target === $("helpOverlay")) closeHelp(); };
+
+  // 积分明细浮窗的外部关闭路径（✕ / 点浮窗之外 / Esc）：document 级委托，绑定一次。
+  // 浮窗与账号卡片都会随时重建，委托不受重建影响。
+  bindCreditDetailDismiss();
 
   $("btnHelp").onclick = openHelp;
   $("btnAbout").onclick = openAbout;
@@ -1964,6 +3942,32 @@ function bind() {
 
   $("aboutOverlay").onclick = (e) => { if (e.target === $("aboutOverlay")) closeAbout(); };
 }
+
+// ---------- 用量与流水面板（变量声明必须在 init 执行前——bindUsage() 在 init 顶部调用） ----------
+// usageDays 从 localStorage 恢复上次选择（今日/7日），刷新页面不重置回 7 日。
+// 存储键与 TOAST_SEEN_KEY 同族（usage-range-seen）；非法值回退默认 7。
+// ⚠️ 本段必须在 init() 之前执行：bindUsage() 在 init 顶部被调用并引用 usageDays，
+//    若声明滞后于 init（IIFE 立即执行），let 处于暂时性死区（TDZ）会抛
+//    ReferenceError 中断整个 init —— 实测表现：账号卡片/费率表全空白、
+//    控制台报 "Cannot access 'usageDays' before initialization"。
+const USAGE_DAYS_KEY = "usage-range-seen";
+const USAGE_DAYS_VALID = [1, 7];
+let usageDays = 7;
+try {
+  const v = parseInt(localStorage.getItem(USAGE_DAYS_KEY) || "", 10);
+  if (USAGE_DAYS_VALID.includes(v)) usageDays = v;
+} catch (e) { /* localStorage 不可用时保持默认 */ }
+// persistUsageDays 落盘当前区间（不可用存储时静默失败，不阻塞功能）。
+function persistUsageDays() {
+  try { localStorage.setItem(USAGE_DAYS_KEY, String(usageDays)); } catch (e) { /* 忽略 */ }
+}
+let usageChart = null;    // token 折线图（echarts 实例）
+let creditChart = null;   // 积分消耗折线图（echarts 实例）
+let recentAll = [];       // 全量最近流水（分页源，时间升序）
+let recentPage = 0;
+let lastNames = {};       // 最近一次渲染的 uid→昵称表（翻页时复用）
+const RECENT_PAGE_SIZE = 20;
+const MODEL_TOP_N = 20;   // 模型榜只保留前 N 名
 
 // ---------- 初始化 ----------
 // afterStateReady 在 state 就绪后执行「依赖 state 的一次性初始化」。
@@ -2011,16 +4015,6 @@ function afterStateReady() {
   setInterval(pollInUse, INUSE_POLL_MS);
 })();
 
-// ---------- 用量与流水面板 ----------
-let usageDays = 7;
-let usageChart = null;    // token 折线图（echarts 实例）
-let creditChart = null;   // 积分消耗折线图（echarts 实例）
-let recentAll = [];       // 全量最近流水（分页源，时间升序）
-let recentPage = 0;
-let lastNames = {};       // 最近一次渲染的 uid→昵称表（翻页时复用）
-const RECENT_PAGE_SIZE = 20;
-const MODEL_TOP_N = 20;   // 模型榜只保留前 N 名
-
 function fmtCredits(n) {
   if (n == null) return "-";
   return Number(n).toLocaleString("zh-CN");
@@ -2033,10 +4027,41 @@ function fmtTokensFull(n) {
   return Number(n).toLocaleString("zh-CN");
 }
 
-const CH_NAMES = {
-  workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork",
-  qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言",
-};
+// fmtAxisTokens 坐标轴专用紧凑刻度：万/亿取整不带小数（刻度无需精度，悬浮明细仍用 fmtTokensFull）。
+// 「8000.0万」这类长标签会撑爆 50px 网格边距、被画布裁成 0000.0万。
+function fmtAxisTokens(n) {
+  if (!n) return "0";
+  if (n >= 1e8) return Math.round(n / 1e8) + "亿";
+  if (n >= 1e4) return Math.round(n / 1e4) + "万";
+  return String(Math.round(n));
+}
+
+// cacheCell 渲染「缓存利用率」单元格。**优雅降级的三态**（后端约定）：
+//   cr_cov > 0 → 有上报样本，显示百分比（可准确到 0%，那是真没命中）
+//   cr_cov = 0 → 上游不提供该维度（glm / raccoon 等）→ 显示「—」，**绝不显示 0%**
+// 把「命中率为零」与「不知道」区分开是本列的核心要求：后者显示 0% 会误导用户
+// 以为换渠道/改提示词就能改善，而实际上是上游根本不回报这个指标。
+function cacheCell(r) {
+  const cov = Number(r.cr_cov) || 0;
+  if (cov <= 0) return `<span class="muted" title="该模型的上游不提供缓存命中字段（本工具不做估算）">—</span>`;
+  const hit = Number(r.cr) || 0;
+  const pct = (hit / cov) * 100;
+  // 样本量少时刻意标低可信度：单次请求的命中率很可能不代表稳态
+  const n = Number(r.cr_reqs) || 0;
+  const tip = `命中 ${fmtTokensFull(hit)} / 上报请求 prompt ${fmtTokensFull(cov)}（${n} 次上报请求）`;
+  const shown = pct >= 10 ? pct.toFixed(1) : pct.toFixed(2);
+  return `<span class="cache-pct" title="${esc(tip)}">${shown}%</span>`;
+}
+
+// renderUsageCacheCard 汇总卡：无任何上报样本时显示「—」（同样不伪造 0%）
+function renderUsageCacheCard(t) {
+  const cov = Number(t.cr_cov) || 0;
+  const el = $("ucCache");
+  if (cov <= 0) { el.textContent = "—"; el.title = "当前窗口内没有渠道上报缓存字段"; return; }
+  const pct = ((Number(t.cr) || 0) / cov) * 100;
+  el.textContent = (pct >= 10 ? pct.toFixed(1) : pct.toFixed(2)) + "%";
+  el.title = `命中 ${fmtTokensFull(t.cr)} / 上报请求 prompt ${fmtTokensFull(cov)}（${t.cr_reqs || 0} 次上报请求）；未上报的渠道不计入分母`;
+}
 
 async function loadUsage() {
   try {
@@ -2053,6 +4078,8 @@ function renderUsage(st) {
   $("ucReqs").textContent = fmtCredits(st.token.requests);
   $("ucSpend").textContent = fmtCredits(st.credit.spend);
   $("ucEarn").textContent = fmtCredits(st.credit.earn);
+  renderUsageCacheCard(st.token || {});
+  syncUsageRangeActive(); // 高亮始终跟随 usageDays（含异步返回路径）
 
   renderModelTable(st.token.by_model || [], usageDays);
   renderCreditTab(st.credit || {});
@@ -2060,16 +4087,25 @@ function renderUsage(st) {
   renderCreditChart(st.credit || {});
 }
 
+// syncUsageRangeActive 把「今日/7日」按钮高亮同步为当前 usageDays。
+// 单一入口：初始化、点击切换、异步返回都走它，避免三处 toggle 竞态
+// （此前点击后 loadUsage 异步返回时高亮被回写错误的 bug）。
+function syncUsageRangeActive() {
+  $("usageRange").querySelectorAll(".seg-btn").forEach((x) =>
+    x.classList.toggle("active", parseInt(x.dataset.days, 10) === usageDays));
+}
+
 function renderModelTable(rows, days) {
   const tb = $("tblModels").querySelector("tbody");
-  if (!rows.length) { tb.innerHTML = `<tr><td colspan="5" class="empty-cell">暂无数据（流水自本功能上线后开始记录）</td></tr>`; return; }
+  if (!rows.length) { tb.innerHTML = `<tr><td colspan="7" class="empty-cell">暂无数据（流水自本功能上线后开始记录）</td></tr>`; return; }
   const top = rows.slice(0, MODEL_TOP_N); // 前 20 名，已按 token 降序
   tb.innerHTML = top.map((r) => {
     const avg = days > 1 ? Math.round((r.pt + r.ct) / days) : (r.pt + r.ct);
     return `<tr>
-      <td>${esc(r.model)}</td><td><span class="badge ${chClass(r.channel)}">${esc(chLabel(r.channel))}</span></td>
+      <td>${esc(r.model)}</td><td>${chBadge(r.channel)}</td>
       <td class="num">${fmtCredits(r.requests)}</td><td class="num">${fmtTokensFull(r.pt + r.ct)}</td>
-      <td class="num">${fmtTokensFull(avg)}</td></tr>`;
+      <td class="num">${fmtTokensFull(avg)}</td>
+      <td class="num">${cacheCell(r)}</td><td class="num">${perfCellFor(r.channel, r.model)}</td></tr>`;
   }).join("");
 }
 
@@ -2094,10 +4130,10 @@ function renderRecentPage(names) {
   const slice = recentAll.slice(start, end).reverse();
   $("recentList").innerHTML = slice.length
     ? slice.map((r) => `<div class="rline ${r.kind}">
-        <span class="rtime">${new Date(r.ts * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
+        <span class="rtime">${fmtDateTime24(r.ts)}</span>
         <span class="rkind">${kinds[r.kind] || r.kind}</span>
         <span class="ramount">${fmtCredits(r.amount)}</span>
-        <span class="racct"><span class="badge ${chClass(r.channel)}">${esc(chLabel(r.channel))}</span> ${esc((names || {})[r.uid] || shortUid(r.uid))}</span>
+        <span class="racct">${chBadge(r.channel)} ${esc((names || {})[r.uid] || shortUid(r.uid))}</span>
         <span class="rname">${esc(r.note || "")}</span>
         <span class="rbal">余额 ${fmtCredits(r.balance)}</span></div>`).join("")
     : `<div class="muted" style="padding:8px">暂无流水</div>`;
@@ -2121,18 +4157,46 @@ function renderUsageChart(st) {
   if (!usageChart) return;
   const byDay = (st.token.by_day || []);
   const dates = byDay.map((d) => d.date);
-  // 渠道系列：取所有出现过的渠道并集
+  // 横轴就是后端下发的完整刻度序列（days=1 ⇒ 00:00~23:00，days=7 ⇒ 窗口内每天），
+  // 不在前端再算一遍：刻度口径只能有一个来源，否则「桶补到哪」又会两处打架（R98）。
+  // 渠道系列：取所有出现过的渠道并集，按区间总量降序（主力渠道排在图例最前）
+  const totalOf = {};
   const chans = [...new Set(byDay.flatMap((d) => Object.keys(d.by_channel || {})))];
-  const series = chans.map((ch) => ({
-    name: CH_NAMES[ch] || ch, type: "line", smooth: true,
-    data: byDay.map((d) => d.by_channel[ch] || 0),
+  for (const d of byDay) for (const [ch, v] of Object.entries(d.by_channel || {})) totalOf[ch] = (totalOf[ch] || 0) + v;
+  chans.sort((a, b) => (totalOf[b] || 0) - (totalOf[a] || 0));
+  // 区间内总量为 0 的渠道不画（连图例都不出现）。
+  const active = chans.filter((ch) => (totalOf[ch] || 0) > 0);
+  // 0 值一律画成 null（断点），不画成 0：
+  //   · 画成 0 ⇒ 每个"该渠道没跑"的时刻都落一个 0 点，ECharts 用直线把它们串起来，
+  //     于是图上恒有一条贴 X 轴的长线（用户实测：底部总有一条线）。
+  //   · 画成 null ⇒ 该时刻不产生点，曲线只覆盖真正有量的时段（中间自然断开）。
+  // 语义上也更准确：0 在这里表示"没观测到用量"，不是"观测到用量为 0"。
+  const series = active.map((ch) => ({
+    name: chLabel(ch), type: "line", smooth: true,
+    itemStyle: { color: chColor(ch) }, lineStyle: { color: chColor(ch) },
+    connectNulls: false,
+    data: byDay.map((d) => { const v = d.by_channel[ch]; return v > 0 ? v : null; }),
   }));
   usageChart.setOption({
-    tooltip: { trigger: "axis" },
-    legend: { data: series.map((s) => s.name) },
-    grid: { left: 50, right: 20, top: 36, bottom: 28 },
+    color: active.map((ch) => chColor(ch)),
+    tooltip: {
+      trigger: "axis",
+      // 全 0 的时刻点不弹悬浮（避免清晨无用量时一片 0 刷屏）；
+      // 有数据时也过滤掉 0 值系列，只看当下真正在跑的渠道；
+      // 并按该时刻用量从多到少排序（与图例「主力在前」同一口径，不再按系列声明序）。
+      formatter: (params) => {
+        const list = params.filter((p) => p.value > 0).sort((a, b) => b.value - a.value);
+        if (!list.length) return "";
+        const head = `<div style="font-weight:600;margin-bottom:4px">${esc(params[0].axisValue)}</div>`;
+        return head + list.map((p) =>
+          `<div>${p.marker}${esc(p.seriesName)}：${fmtTokensFull(p.value)}</div>`).join("");
+      },
+    },
+    legend: { type: "scroll", data: series.map((s) => s.name),
+      tooltip: { show: true } },
+    grid: { left: 8, right: 20, top: 36, bottom: 28, containLabel: true },
     xAxis: { type: "category", data: dates },
-    yAxis: { type: "value", axisLabel: { formatter: (v) => fmtTokensFull(v) } },
+    yAxis: { type: "value", axisLabel: { formatter: (v) => fmtAxisTokens(v) } },
     series,
   }, true);
   usageChart.resize();
@@ -2147,30 +4211,57 @@ function renderCreditChart(entries, names) {
   box.style.display = "";
   creditChart = makeChart(box, creditChart);
   if (!creditChart) return;
-  // 按日 × 账号聚合
-  const dates = [...new Set(spends.map((e) => fmtDay(e.ts)))].sort();
+  // 按日（今日视图按小时）× 账号聚合
+  const dates = usageAxisKeys(usageDays); // 固定整窗刻度，不是「只有消耗的时段」
+  const keyOf = (ts) => (usageDays === 1 ? fmtHour(ts) : fmtDay(ts));
   const byAcct = {}; // uid -> {date: spend}
   const totals = {}; // uid -> 总消耗
   for (const e of spends) {
-    const d = fmtDay(e.ts);
+    const d = keyOf(e.ts);
+    if (!dates.includes(d)) continue; // 窗口外条目（不应出现）不建桶，也不进 top10 统计
     (byAcct[e.uid] ||= {})[d] = (byAcct[e.uid][d] || 0) + -e.amount;
     totals[e.uid] = (totals[e.uid] || 0) + -e.amount;
   }
-  const top10 = Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
+  // 消耗总量为 0 的账号不画（同 token 图口径）：只有退款的账号净消耗可能为 0，
+  // 画出来就是一条贴 0 轴的长线。
+  const top10 = Object.keys(totals).sort((a, b) => totals[b] - totals[a])
+    .filter((uid) => (totals[uid] || 0) > 0).slice(0, 10);
   // 系列名带渠道前缀（跨渠道同名昵称可区分）：取该账号消耗条目中最多的渠道
   const mainChOf = (uid) => {
     const cnt = {};
     for (const e of spends) if (e.uid === uid) cnt[e.channel] = (cnt[e.channel] || 0) + 1;
     return Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0] || "";
   };
+  // 同渠道多个账号时做颜色变体，保证 10 条线互不相同
+  const colorByUid = {};
+  const vIdx = {};
+  for (const uid of top10) {
+    const ch = mainChOf(uid);
+    colorByUid[uid] = varyColor(chColor(ch), vIdx[ch] = (vIdx[ch] ?? -1) + 1);
+  }
   const series = top10.map((uid) => ({
     name: `${chLabel(mainChOf(uid))} ${names[uid] || shortUid(uid)}`, type: "line", smooth: true,
-    data: dates.map((d) => byAcct[uid][d] || 0),
+    itemStyle: { color: colorByUid[uid] }, lineStyle: { color: colorByUid[uid] },
+    connectNulls: false,
+    // 同 token 图：0 值画成 null（断点），避免"该账号当天没消耗"被画成贴 0 轴的长线。
+    data: dates.map((d) => { const v = byAcct[uid][d]; return v > 0 ? v : null; }),
   }));
   creditChart.setOption({
-    tooltip: { trigger: "axis", valueFormatter: (v) => fmtCredits(v) },
-    legend: { data: series.map((s) => s.name) },
-    grid: { left: 50, right: 20, top: 36, bottom: 28 },
+    color: top10.map((uid) => colorByUid[uid]),
+    tooltip: {
+      trigger: "axis", valueFormatter: (v) => fmtCredits(v),
+      formatter: (params) => {
+        // 同 token 图：悬浮按该时刻消耗从多到少排序，最大的一条在最上面。
+        const list = params.filter((p) => p.value > 0).sort((a, b) => b.value - a.value);
+        if (!list.length) return "";
+        const head = `<div style="font-weight:600;margin-bottom:4px">${esc(params[0].axisValue)}</div>`;
+        return head + list.map((p) =>
+          `<div>${p.marker}${esc(p.seriesName)}：${fmtCredits(p.value)}</div>`).join("");
+      },
+    },
+    legend: { type: "scroll", data: series.map((s) => s.name),
+      tooltip: { show: true } },
+    grid: { left: 8, right: 20, top: 36, bottom: 28, containLabel: true },
     xAxis: { type: "category", data: dates },
     yAxis: { type: "value", axisLabel: { formatter: (v) => fmtCredits(v) } },
     series,
@@ -2184,7 +4275,31 @@ function fmtDay(ts) {
   return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-// 主面板 tab 切换（账号管理 / 用量与流水 / 运行统计）
+// fmtHour 时间戳 → "09:00"（今日视图的小时桶键，与后端 by_day 的 date 同形）
+function fmtHour(ts) {
+  const d = new Date(ts * 1000);
+  return `${String(d.getHours()).padStart(2, "0")}:00`;
+}
+
+// usageAxisKeys 固定横轴刻度（R98）：
+//   days=1 ⇒ 当天 00:00~23:00 共 24 个小时桶；days>1 ⇒ 窗口内每天（含今天）。
+// **刻度只跟区间有关，与「当前几点」无关**——后端 ledger.Query 已按同一口径补齐空桶，
+// 这里算一份是为了让积分图（自己按流水聚合，不走 by_day）跟 token 图刻度完全对齐。
+function usageAxisKeys(days) {
+  const now = new Date();
+  const out = [];
+  if (days === 1) {
+    for (let h = 0; h < 24; h++) out.push(`${String(h).padStart(2, "0")}:00`);
+    return out;
+  }
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+    out.push(`${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`);
+  }
+  return out;
+}
+
+// 主面板 tab 切换（账号管理 / 用量与流水 / 运行统计 / 模型列表和费率）
 function bindMainTabs() {
   document.querySelectorAll(".main-tabs .mtab").forEach((b) => {
     b.onclick = () => {
@@ -2192,6 +4307,9 @@ function bindMainTabs() {
       $("mtabAccounts").classList.toggle("hidden", b.dataset.mtab !== "accounts");
       $("mtabUsage").classList.toggle("hidden", b.dataset.mtab !== "usage");
       $("mtabStats").classList.toggle("hidden", b.dataset.mtab !== "stats");
+      $("mtabFees").classList.toggle("hidden", b.dataset.mtab !== "fees");
+      // 切换主 tab 强制收起积分明细浮窗，避免残留浮在其他页签上
+      closeCreditDetail();
       if (b.dataset.mtab === "usage") {
         loadUsage(); // 切到用量 tab 时拉最新（首次渲染自动刷新）
         if (usageChart) usageChart.resize();
@@ -2199,6 +4317,7 @@ function bindMainTabs() {
       }
       if (b.dataset.mtab === "stats") {
         loadStats(); // 切到运行统计 tab 时拉最新（后台 30s 轮询兜底）
+        fitPlatCols(); // 之前隐藏时跳过测量，切回时按当前字号重算列宽
       }
     };
   });
@@ -2213,10 +4332,12 @@ function bindUsage() {
   $("usageRange").querySelectorAll(".seg-btn").forEach((b) => {
     b.onclick = () => {
       usageDays = parseInt(b.dataset.days, 10);
-      $("usageRange").querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("active", x === b));
+      persistUsageDays(); // 记住选择，刷新不重置
+      syncUsageRangeActive(); // 单一入口同步高亮
       loadUsage();
     };
   });
+  syncUsageRangeActive(); // 初始高亮按恢复的 usageDays（localStorage 命中「今日」不显示 7日 高亮）
   document.querySelectorAll(".tabs .tab").forEach((b) => {
     b.onclick = () => {
       document.querySelectorAll(".tabs .tab").forEach((x) => x.classList.toggle("active", x === b));
@@ -2282,6 +4403,7 @@ async function loadStats() {
     ]);
     renderStats(s);
     renderAbnormal(s.abnormal || []);
+    renderFallbacks(s.fallbacks || []);
     if (lg) renderLogs(lg.rows || []);
     stMarkUpdated();
   } catch (e) {
@@ -2300,30 +4422,41 @@ async function loadAppLog() {
 }
 
 // 汇总横条条目（标签 + 等宽数值 + 可选小字注解）
-function stSumItem(label, val, cls, sub) {
-  return `<span class="st-sum-item"><span class="st-sum-label">${label}</span>` +
-    `<span class="st-sum-val ${cls || ""}">${val}</span>` +
-    (sub ? `<span class="st-sum-sub">${sub}</span>` : "") + `</span>`;
-}
-// Token 多天行条目
 function stTkItem(label, val) {
   return `<span class="st-tk-item">${label} <span class="st-tk-val">${val}</span></span>`;
 }
 
+// perfLookup 运行统计引擎的「模型 → 速度」索引（key = "channel/model"）。
+// 速度数据只存在于 stats 引擎内存（ledger 只扫文件、无速度字段），
+// 用量 tab 展示平均速度时按此表匹配；键形与 stats 的 models[].model 一致。
+let perfLookup = {};
+
+// perfCellFor 按 "channel/model" 取速度单元格；无样本显示「—」（与运行统计同款三态）。
+function perfCellFor(channel, model) {
+  const m = perfLookup[channel + "/" + model];
+  if (!m) return `<span class="muted" title="该模型暂无成功请求的速度样本">—</span>`;
+  const tps = Number(m.avg_tok_per_sec) || 0;
+  const ttfb = Number(m.avg_ttfb_ms) || 0;
+  const parts = [];
+  if (tps > 0) parts.push(fmtPct(tps) + " tok/s");
+  if (ttfb > 0) parts.push(fmtCredits(ttfb) + "ms");
+  if (!parts.length) return `<span class="muted" title="无速度样本">—</span>`;
+  return `<span title="样本 ${fmtCredits(m.perf_samples)} 次成功请求">${parts.join(" · ")}</span>`;
+}
+
+// buildPerfLookup 用 stats 快照的 models[] 建索引（30s 轮询时刷新）。
+function buildPerfLookup(models) {
+  const lk = {};
+  for (const m of models || []) {
+    if (m && m.model) lk[m.model] = m;
+  }
+  perfLookup = lk;
+}
+
 function renderStats(s) {
   const tu = s.token_usage || {};
-  // 汇总横条：作废/今日到期仅 >0 时出现（避免每天多条 0 值噪音）
-  $("stSum").innerHTML =
-    stSumItem("总积分", fmtCredits(s.total_credits) + "分", "pur", fmtCredits(s.total_accounts) + " 个账号") +
-    stSumItem("收入积分", fmtCredits(s.credit_in), "ok", "签到事件口径") +
-    stSumItem("今日消耗", fmtCredits(s.credit_used), "warn", "精确 " + fmtCreditS(s.credit_out_exact)) +
-    (Number(s.credit_expired) > 0
-      ? stSumItem("今日作废", fmtCredits(s.credit_expired), "risk", "积分包到期 · 非消耗")
-      : "") +
-    stSumItem("消耗 Token", fmtTokensFull(s.tokens), "warn") +
-    (Number(s.expire_today) > 0
-      ? stSumItem("今日到期", fmtCredits(s.expire_today) + "分", "risk", "今晚作废尽快消耗")
-      : "");
+  // 汇总横条已删（与合计行重复）：全池汇总数字全部由平台表合计行呈现，
+  // 仅 >0 才出现的「今日作废/今日到期」也走合计行（列常年存在，零值置灰）。
   $("stMilestone").textContent = s.milestone_count > 0 ? `里程碑 ${s.milestone_count}×100分` : "";
   renderPlatformTable(s);
   // Token 多天行（今日情况标题右侧）
@@ -2336,12 +4469,20 @@ function renderStats(s) {
   renderRotation(s.rotation || []);
   renderExpiry(s.expiry || []);
   renderModels(s.models || []);
+  buildPerfLookup(s.models || []); // 用量 tab 的速度列数据源（同源同频刷新）
   handleToasts(s.toasts || []);
 }
 
-// 平台表（今日情况主视图）：列 = #/平台/账号/当前积分/今日收入/今日消耗(净值)/今日Token/
-// 今日到期/明日到期/7日内到期，末行合计。「今日消耗」= 差值花费 − 积分包到期作废（净值才是真消耗）。
-// 合计行取全池口径，与顶部汇总横条严格同源（合计 == 横条可互相印证）。
+// 平台表（今日情况主视图）：列 = #/平台/账号/当前积分/今日收入/今日消耗(净值)/今日作废/
+// 今日消耗Token/今日到期/明日到期/7日内到期，末行合计。「今日消耗」= 差值花费 − 积分包到期作废
+// （净值才是真消耗）；「今日作废」= ledger 当日 expire 流水（往回看：已经没了多少），
+// 与「今日到期」（往前看：今晚余额里还有多少会没）是相反方向的两个口径，不能混为一列。
+//
+// 到期三列口径（2026-10-19 用户定义，后端 provider.ExpireBucketOf 同一实现）：
+// 按**精确时刻**判定，桶的边界是**自然日**，且**次日 00:00:00 失效算今日**——
+// 上游每日类额度（qwenwork valid_to、traework 签到 expire_time）就是次日零点失效，
+// 归「明日」会让人以为还有一整天。列头 title 全部收敛到「今日情况」旁那一个 ? 角标，
+// 避免同一套说明在四个地方各写一遍、改口径时漏改。
 function renderPlatformTable(s) {
   const rows = s.platforms || [];
   if (!rows.length) { $("stPlat").innerHTML = ""; return; }
@@ -2352,6 +4493,7 @@ function renderPlatformTable(s) {
     `<span class="st-plat-credits">当前积分</span>` +
     `<span class="st-plat-in">今日收入</span>` +
     `<span class="st-plat-out" title="花费差值扣除积分包到期作废后的净消耗">今日消耗</span>` +
+    `<span class="st-plat-expd" title="今日已到期的积分包额度（已从余额消失，不是消耗）">今日作废</span>` +
     `<span class="st-plat-tokens">今日消耗Token</span>` +
     `<span class="st-plat-exp">今日到期</span>` +
     `<span class="st-plat-exp">明日到期</span>` +
@@ -2360,31 +4502,75 @@ function renderPlatformTable(s) {
   rows.forEach((r, i) => {
     html += `<div class="st-plat-row">` +
       `<span class="st-plat-no">${i + 1}</span>` +
-      `<span class="st-plat-slot"><span class="badge ${chClass(r.group)}">${esc(chLabel(r.group))}</span></span>` +
+      `<span class="st-plat-slot">${chBadge(r.group)}</span>` +
       `<span class="st-plat-accts">${fmtCredits(r.accounts)}</span>` +
       stPlatNum("st-plat-credits", r.credits, "分") +
       stPlatNum("st-plat-in", r.credit_in) +
       stPlatNum("st-plat-out", r.credit_used) +
+      stPlatNum("st-plat-expd", r.credit_expired) +
       stPlatTok(r.tokens) +
       stPlatNum("st-plat-exp", r.expire_today, "分") +
       stPlatNum("st-plat-exp", r.expire_tomorrow, "分") +
       stPlatNum("st-plat-exp", r.expire_7d, "分") +
       `</div>`;
   });
-  // 合计行：与顶部汇总横条同源
+  // 合计行：与旧汇总横条同信息量——消耗列带「精确」小注（逐请求 usage 帧口径），
+  // title 悬浮说明净消耗 = 差值花费 - 作废。
+  const sumExact = Number(s.credit_out_exact) > 0 ? ` title="净消耗 ${fmtCredits(s.credit_used)}：差值扣除作废 ${fmtCredits(s.credit_expired)}；逐请求精确 ${fmtCreditS(s.credit_out_exact)}"` : "";
   html += `<div class="st-plat-row st-plat-sum-row">` +
     `<span class="st-plat-no"></span>` +
     `<span class="st-plat-slot">合计</span>` +
     `<span class="st-plat-accts">${fmtCredits(s.total_accounts)}</span>` +
     stPlatNum("st-plat-credits", s.total_credits, "分") +
     stPlatNum("st-plat-in", s.credit_in) +
-    stPlatNum("st-plat-out", s.credit_used) +
+    `<span class="st-plat-out"${sumExact}>${fmtCredits(s.credit_used)}${Number(s.credit_out_exact) > 0 ? ` <span class="st-plat-sub">(精 ${fmtCreditS(s.credit_out_exact)})</span>` : ""}</span>` +
+    stPlatNum("st-plat-expd", s.credit_expired) +
     stPlatTok(s.tokens) +
     stPlatNum("st-plat-exp", s.expire_today, "分") +
     stPlatNum("st-plat-exp", s.expire_tomorrow, "分") +
     stPlatNum("st-plat-exp", s.expiring_7d, "分") +
     `</div>`;
   $("stPlat").innerHTML = html;
+  fitPlatCols();
+}
+
+// fitPlatCols 平台表动态列宽：每行是独立 grid，固定 px 遇到大额数字会截断
+// （合计行「(精 xxx.xx)」/积分上千/万）；也不能改 auto 列——各行独立解析会跨行错位。
+// 渲染后实测每列所有行（含表头/合计）最宽 cell 的 scrollWidth，经容器 CSS 变量
+// --plat-cols 统一应用。不可见时（tab 隐藏）scrollWidth 全为 0，跳过等切回时重测。
+function fitPlatCols() {
+  const el = $("stPlat");
+  const rows = [...el.querySelectorAll(".st-plat-row")];
+  if (!rows.length || !rows[0].offsetParent) return;
+  // 测量「内容需要的宽度」：cell 是 overflow:hidden 的 flex 容器，scrollWidth 被
+  // 当前列宽钳住（列宽 96px 永远量出 96px，死循环自洽）。改成临时把所有 cell
+  // position:absolute + width:max-content：脱离 grid 流按内容自适应撑开，
+  // offsetWidth 即真实需求；一次性进入测量态、统一读、再统一还原（避免逐 cell 反复重排）。
+  const cells = [];
+  for (const r of rows) {
+    for (const c of r.children) {
+      cells.push([c, c.style.position, c.style.width]);
+      c.style.position = "absolute";
+      c.style.width = "max-content";
+    }
+  }
+  const max = [];
+  rows.forEach((r) => {
+    [...r.children].forEach((c, i) => {
+      max[i] = Math.max(max[i] || 0, c.offsetWidth);
+    });
+  });
+  for (const [c, p, w] of cells) { c.style.position = p; c.style.width = w; }
+  // 首列(#)固定 28px；平台列 minmax(实测, 1fr)——吸收表格剩余空白（徽章左对齐，
+  // 空白自然落在徽章右侧）；其余列固定为实测宽 +2px 余量。
+  // 末列不用 1fr：总宽超出时 1fr 会被压到内容之下把数字剪掉；
+  // 也不用 max-content：它不吸收空白，右侧会裸露一块「无主宽度」。
+  const cols = max.map((w, i) => {
+    if (i === 0) return "28px";
+    if (i === 1) return `minmax(${w + 2}px, 1fr)`;
+    return (w + 2) + "px";
+  });
+  el.style.setProperty("--plat-cols", cols.join(" "));
 }
 
 // 平台表数值单元格：0 值置灰「—」（避免满屏 0 淹没真正有数的列），颜色由列类自带
@@ -2402,20 +4588,30 @@ function stPlatTok(amount) {
 
 const ST_ROT_MARKS = ["①", "②", "③"];
 
+// groupUnit 渠道的计量单位（""=积分 / "token"=Token 计数）：从 state.accounts 同渠道账号取，
+// 保证与卡片、汇总条、费率页角标**同源**（单一来源仍是后端的 credits_unit）。
+function groupUnit(group) {
+  const a = (state.accounts || []).find((x) => (x.group || "workbuddy") === group);
+  return a && a.credits_unit === "token" ? "token" : "";
+}
+
 // 使用中 / 接棒顺序：当前=粘性账号；接棒=临期优先+余额排序推算的前 3
 function renderRotation(rot) {
   if (!rot.length) { $("stRotation").innerHTML = ""; $("stRotation").className = "st-rotation"; return; }
   let html = `<div class="st-block-title">使用中 / 接棒顺序<span class="st-hint">当前=粘性账号 · 接棒=临期优先+余额排序推算</span></div>`;
   for (const rv of rot) {
+    // 单位随渠道切换：token 计量渠道（如 ZCode）显示 tokens，不再一律写「分」。
+    const isTok = groupUnit(rv.group) === "token";
+    const bal = (v) => (isTok ? `${fmtTokens(v)} tokens` : `${fmtCredits(v)}分`);
     const cur = rv.current
-      ? `使用中 <b>${esc(rv.current.nickname)}</b>（粘性 ${esc(rv.current.sticky || "0")}，余额 ${fmtCredits(rv.current.credits)}分）`
+      ? `使用中 <b>${esc(rv.current.nickname)}</b>（粘性 ${esc(rv.current.sticky || "0")}，余额 ${bal(rv.current.credits)}）`
       : `<span class="st-rot-none">暂无使用记录</span>`;
     let nextHtml = "";
     (rv.next || []).forEach((n, j) => {
       nextHtml += `<span class="st-rot-next">${ST_ROT_MARKS[j]} ${esc(n.nickname)}` +
-        `（${fmtCredits(n.credits)}分${n.expiring > 0 ? "·临期" + fmtCredits(n.expiring) : ""}）</span>`;
+        `（${bal(n.credits)}${n.expiring > 0 ? "·临期" + bal(n.expiring) : ""}）</span>`;
     });
-    html += `<div class="st-rot-row"><span class="badge ${chClass(rv.group)}">${esc(chLabel(rv.group))}</span>` +
+    html += `<div class="st-rot-row">${chBadge(rv.group)}` +
       `<span class="st-rot-cur">${cur}</span>` +
       (nextHtml ? `<span class="st-rot-nexts">${nextHtml}</span>` : "") + `</div>`;
   }
@@ -2423,27 +4619,61 @@ function renderRotation(rot) {
   $("stRotation").className = "st-rotation st-block";
 }
 
+// fmtExpireAt 把上游 ExpireAt 渲染成**完整标准时间**「YYYY-MM-DD HH:MM:SS」。
+//
+// 为什么需要：后端下发的是 RFC3339（`2026-10-20T00:00:00+08:00`），直接显示
+// 又长又被列宽截断（用户实测看不到秒）；纯日期粒度（`2026-10-19`，loomy 之外的
+// 少数渠道仍可能给）则补成「该日 23:59:59」——它的语义是「该日全天可用」，
+// 补 00:00:00 会误导成「当天零点就没了」。
+// 时区固定按 UTC+8 展示（与后端 expireLoc 一致），不依赖浏览器本地时区。
+function fmtExpireAt(s) {
+  if (!s) return "—";
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (m) return `${s} 23:59:59`; // 纯日期：该日全天可用
+  const t = Date.parse(s);
+  if (Number.isNaN(t)) return s; // 解析不了就原样显示，不吞信息
+  const d = new Date(t + 8 * 3600 * 1000); // 转成 UTC+8 墙钟后按 UTC 读数
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
+    `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 // 最近临期：到期日升序；risk=按今日速度花不完 → 给预计作废量（额度−外推消耗）
 function renderExpiry(ex) {
   if (!ex.length) { $("stExpiry").innerHTML = ""; $("stExpiry").className = "st-expiry"; return; }
-  let html = `<div class="st-block-title">最近临期<span class="st-hint">按到期日升序 · ${ex.length} 个账号</span></div>` +
+  let html = `<div class="st-block-title">最近临期<span class="st-hint">按剩余时长升序 · ${ex.length} 个账号</span></div>` +
     `<div class="st-scroll st-ex-scroll">` +
     `<div class="st-ex-row st-ex-head">` +
     `<span class="st-ex-tag">#</span>` +
     `<span class="st-ex-plat-slot">平台</span>` +
     `<span class="st-ex-name">账号</span>` +
-    `<span class="st-ex-date">到期日</span>` +
+    `<span class="st-ex-date">到期时刻</span>` +
     `<span class="st-ex-days">剩余</span>` +
     `<span class="st-ex-amt">额度 · 今日已耗</span>` +
     `</div>`;
   ex.forEach((r, i) => {
-    const dayTxt = r.days_left <= 0 ? "今日到期" : (r.days_left === 1 ? "明日到期" : `${r.days_left} 天后到期`);
-    const burn = r.risk ? ` · 预计作废 ${fmtCredits(r.amount - r.burn_forecast)}分` : "";
-    html += `<div class="st-ex-row${r.risk ? " st-risk" : ""}">` +
+    // 剩余时长优先用后端下发的精确小时数（hours_left），退回自然日文案兜底。
+    // 精确到 0.1h 才能表达「今晚 5.7 小时后就没」，这是本轮改动的核心诉求。
+    const h = Number(r.hours_left);
+    const dayTxt = Number.isFinite(h) && h > 0
+      ? (h < 1 ? `${Math.round(h * 60)} 分钟后` : `${h.toFixed(1)} 小时后`)
+      : (r.days_left <= 0 ? "今日到期" : (r.days_left === 1 ? "明日到期" : `${r.days_left} 天后到期`));
+    // 预计作废：burn_forecast<0 表示观测不足、无法外推，此时按「全部额度都会作废」
+    // 展示（与后端 Risk 判定同口径），不能显示「作废 -1 分」这种反数。
+    const burn = r.risk
+      ? ` · 预计作废 ${fmtCredits(r.burn_forecast < 0 ? r.amount : r.amount - r.burn_forecast)}分`
+      : "";
+    // 配色按**紧迫度**（后端 urgency），不按 risk：
+    //   今天到期 → 红（st-risk）；明天到期 → 黄（st-warn）；更远 → 不上色。
+    // 此前用 risk 上色，7 天内的行全飘红（135 小时后到期的也红），一片警示等于没有警示。
+    // 「预计作废」文字仍只跟 risk 走：那是数据结论，与颜色分档独立。
+    const urg = r.urgency === "today" ? " st-risk"
+      : (r.urgency === "tomorrow" ? " st-warn" : "");
+    html += `<div class="st-ex-row${urg}">` +
       `<span class="st-ex-tag">${i + 1}</span>` +
-      `<span class="st-ex-plat-slot"><span class="badge ${chClass(r.group)}">${esc(chLabel(r.group))}</span></span>` +
+      `<span class="st-ex-plat-slot">${chBadge(r.group)}</span>` +
       `<span class="st-ex-name" title="${esc(r.uid)}">${esc(r.nickname || r.uid)}</span>` +
-      `<span class="st-ex-date">${esc(r.expire_at)}</span>` +
+      `<span class="st-ex-date">${esc(fmtExpireAt(r.expire_at))}</span>` +
       `<span class="st-ex-days">${esc(dayTxt)}</span>` +
       `<span class="st-ex-amt">${fmtCredits(r.amount)}分 · 已耗 ${fmtCredits(r.today_out)}${burn}</span>` +
       `</div>`;
@@ -2455,7 +4685,7 @@ function renderExpiry(ex) {
 
 // 模型消耗（今日，按积分降序）：Trae 系积分加「≈」（分摊估算），平均速度=成功请求实测均值
 function renderModels(models) {
-  let mh = `<tr><th>#</th><th>模型</th><th>次数</th><th>Token</th><th>积分</th>` +
+  let mh = `<tr><th>#</th><th>模型</th><th>次数</th><th>Token</th><th>缓存</th><th>积分</th>` +
     `<th title="成功请求实测均值：tok/s = 生成 token ÷ 生成耗时（按时长加权）；TTFB = 首字节耗时算术平均">平均速度</th></tr>`;
   models.forEach((m, j) => {
     const isTrae = isTraeChannel(m.model);
@@ -2479,10 +4709,12 @@ function renderModels(models) {
       : "—";
     mh += `<tr><td class="st-idx">${j + 1}</td>` +
       `<td class="st-mono" title="${esc(m.model)}">${esc(m.model)}</td>` +
-      `<td>${fmtCredits(m.reqs)}</td><td>${fmtTokensFull(m.tokens)}</td><td>${creditCell}</td>` +
+      `<td>${fmtCredits(m.reqs)}</td><td>${fmtTokensFull(m.tokens)}</td>` +
+      `<td class="st-mono">${cacheCell(m)}</td>` +
+      `<td>${creditCell}</td>` +
       `<td class="st-mono">${perfCell}</td></tr>`;
   });
-  $("stModels").innerHTML = models.length ? mh : `<tr><td class="st-empty" colspan="6">今日暂无消耗</td></tr>`;
+  $("stModels").innerHTML = models.length ? mh : `<tr><td class="st-empty" colspan="7">今日暂无消耗</td></tr>`;
 }
 
 // 请求日志：降序渲染（最新在最上）；tok/s 仅流式有值，0/空给「—」
@@ -2498,6 +4730,55 @@ function renderLogs(rows) {
   }
   $("stLogs").innerHTML = rows.length ? h : `<tr><td class="st-empty">暂无请求</td></tr>`;
 }
+
+// ---------- 降级记录（原模型无可用账号切备胎的事件流；无事件整块隐藏） ----------
+// fmtFbDur 秒数 → 紧凑文案（"42 秒" / "3 分 12 秒" / "1 时 02 分"）
+function fmtFbDur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  if (sec < 60) return sec + " 秒";
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + " 分 " + s + " 秒";
+  return Math.floor(m / 60) + " 时 " + String(m % 60).padStart(2, "0") + " 分";
+}
+
+function renderFallbacks(evs) {
+  const block = $("stFbBlock");
+  block.hidden = false; // 常显：让用户随时知道有这个区块；无事件显示占位行
+  const $t = $("stFbs");
+  if (!evs.length) {
+    $t.innerHTML = `<tr><td class="st-empty">暂无降级记录——原模型无可用账号切备胎时这里会出现事件（降级/恢复时刻与持续时长）</td></tr>`;
+    return;
+  }
+  let h = `<tr><th>#</th><th>降级时间</th><th>原模型</th><th></th><th>备胎</th><th>恢复</th><th>持续</th></tr>`;
+  evs.forEach((e, i) => {
+    h += `<tr class="${e.active ? "fb-active" : ""}">` +
+      `<td>${i + 1}</td>` +
+      `<td class="st-mono">${esc(e.at)}</td>` +
+      `<td class="st-mono" title="${esc(e.from)}">${esc(e.from)}</td>` +
+      `<td class="fb-arrow">→</td>` +
+      `<td class="st-mono" title="${esc(e.to)}">${esc(e.to)}</td>` +
+      (e.active
+        ? `<td><span class="fb-live">● 降级中</span></td><td><span class="fb-live" data-fb-epoch="${e.at_unix}"></span></td>`
+        : `<td class="st-mono">${esc(e.recovered || "—")}</td><td>${fmtFbDur(e.dur_sec)}</td>`) +
+      `</tr>`;
+  });
+  $("stFbs").innerHTML = h;
+}
+
+// 进行中事件的「持续」每秒重算（只改文本不重渲染；元素不存在时空转，开销可忽略）
+setInterval(() => {
+  document.querySelectorAll("[data-fb-epoch]").forEach((el) => {
+    el.textContent = "已 " + fmtFbDur((Date.now() - Number(el.dataset.fbEpoch) * 1000) / 1000);
+  });
+}, 1000);
+
+// 冷却卡片的「剩 X 时 X 分」每 30 秒重算：卡片只在 loadState 事件时重渲染，
+// 不定时刷新会让倒计时停在渲染时刻的值，静止几小时后反而误导。
+setInterval(() => {
+  document.querySelectorAll("[data-until-ts]").forEach((el) => {
+    el.textContent = `（${fmtLeft(Number(el.dataset.untilTs))}）`;
+  });
+}, 30000);
 
 // 异常账号（三级：disabled 已停用 / cool 整号冷却 / err 错误累计；无异常整块隐藏）
 const ABNORMAL_META = {
@@ -2537,7 +4818,7 @@ function renderAbnormal(rows) {
     html += `<div class="st-ab-row ${meta.cls}">` +
       `<span class="st-ab-idx">${i + 1}</span>` +
       `<span class="st-ab-tag-slot"><span class="st-ab-tag" title="${esc(meta.tip)}">${meta.tag}</span></span>` +
-      `<span class="st-ab-plat-slot"><span class="badge ${chClass(r.group)}">${esc(chLabel(r.group))}</span></span>` +
+      `<span class="st-ab-plat-slot">${chBadge(r.group)}</span>` +
       `<span class="st-ab-name" title="${esc(r.uid)}">${esc(r.nickname || r.uid)}</span>` +
       `<span class="st-ab-reason" title="${esc(reason)}">${esc(reason)}</span>` +
       `<span class="st-ab-until">${r.until ? esc(r.until) : "—"}</span>` +

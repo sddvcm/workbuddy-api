@@ -28,7 +28,7 @@
 
 另有渠道前缀白名单（`internal/stats/stats.go`）需同步新增，否则统计漏该渠道。
 
-## 1. 已定决议项（不要推翻，除非有强理由并更新本节）
+### 0.2 其他硬性红线
 
 | # | 决议 | 说明 |
 |---|------|------|
@@ -77,44 +77,106 @@
 | R42 | **渠道本地模型校验必须取「静态表 ∪ 动态目录」的并集**（2026-10-05） | **背景**：raccoon / loomy 都做本地模型名校验（上游对未知模型名**静默回落到默认模型**并返回 200，不校验会让用户以为在用 A、实际扣 B 的额度），但实现只查**静态表**（`KnownModel(id)`）⇒ 上游目录新增的模型会被本地 400 误拒，而**同一个模型正被 `/v1/models` 正常列出**（后者读的是动态目录 `FetchModels` 结果）——表现为「面板列出却调不动」。**实测（2026-10-05）**：raccoon 账户 `/v1/models` 列出 9 个模型，其中 `sn-sensenova-6-8-flash` 调对话被本地 400 `model_not_found`，但直连上游同一模型 **HTTP 200 正常服务**（`sn-sensenova-6-8-flash-lite` 在静态表里、`sn-sensenova-6-8-flash` 不在，二者仅差一个后缀）。**修法**：`fetchCatalog` / `fetchModels` 成功后把目录里的模型名记进 Client（`liveIDs`，**单调扩大、只增不减**——避免目录瞬时抖动把可用模型判成未知），`ChatStream` 改查 `c.knownModel()`（静态表 ∪ liveIDs）。两渠道同款修复 + 回归测试 `TestKnownModelAcceptsLiveCatalog`（去掉并集即失败）。**顺带**：给两个 Client 加 `Base` 字段（默认常量端点，测试注入 httptest 假上游），避免为写这条测试而把 `LLMBase`/`GatewayBase` 从 const 改成 var |
 | R43 | **运行统计（`internal/stats`）与用量流水（`internal/ledger`）是两套并列口径，不合并、不互校**（2026-10-07，PR #71–#73） | **背景**：新增「运行统计」tab 时引入了第二套统计面。分工：`ledger` = 磁盘 JSONL 双流水（`data/ledger/{usage,credit}-*.jsonl`），账号**条目差分**口径，按需扫描聚合（R17）；`stats` = 内存实时 + 按日归档 `data/stats.json`，「今日」口径——消耗走**余额下降差值**、收入走**日志签到事件**（`events.go` 正则解析 `app.log`，因「登录即自动签到」等场景条目晚于入账建立，差值恒 0 漏记）、逐请求 token 走 **usage 帧精确值**（`usage.go`）。**决议**：两者**零共享状态、零互相写入**（stats 仅只读 `ledger.Query(1)` 取当日作废），各自标注口径、互不引用；**数字天然不同是设计而非缺陷**（差值含积分包到期作废，ledger 已拆 spend/expire），**不追求对齐**。**边界**：`ledger` 仍是面板「用量与积分」的数据源与 issue #67 等待修的口径；`stats` 只服务「运行统计」tab。新增统计需求时**先明确归属**（精确拆分→ledger；实时/今日/趋势→stats），**不得**为对齐数字而改动另一侧。**注入纪律**：stats 全部数据输入走**进程内直调**（`allStatuses` / `handler.StickySnapshot` / `ledger.Query`），**不得** HTTP 自环（R13）；`main.go` 须 `go appInst.StartStatsFeeders(sctx)`（漏接线即静默无数据，同 R34 家族） |
 
-## 2. 架构选型（依据）
+---
 
-| 主题 | 选型 | 理由 |
-|------|------|------|
-| GUI 壳 | **无**（删除 wails） | WebView2 内存开销大 + Windows 绑定；托盘 + 浏览器足够 |
-| 托盘 | energye/systray v1.0.3（现有） | 已跨平台；菜单固定方案规避其不可删菜单项限制 |
-| 管理后端 | 现有 http.Server 扩展 /api/* | 单端口、复用鉴权中间件（cookie 会话守卫）、零新服务 |
-| Web UI | 纯静态 embed + fetch | 无 Node 构建链，单 exe 双击即用 |
-| 登录 | 复用 internal/login + login_trae | 纯 HTTP + 本地回调端口，跨平台 |
-| 平台能力 | internal/platform + build tag（windows/darwin/other） | 浏览器无痕/开机自启/消息框/日志/工作区，接口同名 |
-| 构建 | WSL 交叉编译 win；CI macos-latest 编 darwin | 见 R11 |
+## 1. 决议项索引（R1–R96）
 
-## 3. 托盘菜单设计（当前形态）
+**全文（含证据链、反例、已知限制）见 [`docs/决议项.md`](docs/决议项.md)** —— 改动相关代码前必读对应条目。
 
-```
-workbuddy-api
-──────────
-打开主界面          → 系统浏览器打开 http://<listen>/
-查看日志            → 系统默认编辑器打开 data/app.log
-──────────
-退出                → 退出 daemon（确认框）
-```
+| # | 决议摘要 |
+|---|----------|
+| R1–R3 | 托盘菜单固定（打开主界面/查看日志/退出），不做动态刷新；「刷新积分」已移到 Web UI |
+| R4 | 管理 API 用 cookie 会话鉴权（监听非环回时强制要求设密码） |
+| R5–R8 | Web UI 纯静态 embed；托盘用 energye/systray；移除 wails/WebView2；daemon 单进程单 `http.Server` |
+| R9 | 核心业务整体复用，config/auth/state 格式零迁移（向后兼容） |
+| R10 | 新增渠道 = 实现 `provider.Upstream` + auth 加载器 + 注册 Runtime；模型前缀 `channel/<model>` 路由 |
+| R11–R12 | Win 产物 WSL 交叉编译、mac 走 CI（cgo）；无桌面 Linux 用 `--no-tray` |
+| R13–R15 | 三接口兼容用 `internal/gateway` 边缘层 + in-process（`io.Pipe`）；`model` 显式传参；Responses/Anthropic 规范形状 |
+| R16 | 无账号渠道（oczen）不建 auth、不进 `reloadAccounts`、不参与账号级惩罚 |
+| R17 | 用量/积分**双流水分口径**（`ledger`），不强关联不折算 |
+| R18 | 临期阈值可配（默认 24h，下限 24h） |
+| R19 | TraeWork 专用池判据仅 `available_endpoint==1`（pid==209 已撤回） |
+| R20–R21 | 千问办公 body 必带 `business` 段；`expires_in` 单位是**秒**，`expiresAt` 可用 JWT `exp` 校正 |
+| R22–R33 | 智谱清言：网页版私有接口 + CDP 自动登录；签到=保活对话；新号额度需 App 登录；SSE 是增量 delta；模型名带 `:moe_53f` 后缀 |
+| R23b | **分析纪律：观察性数据只能提假设，定因果必须做对照实验** |
+| R24 | 清言是正常多账号渠道（`SingleAccount` 不设）；`SingleAccount` 是结构性声明，不是保险丝 |
+| R29 | 轮换语义 = 粘性路由 + 错误惩罚 + **同请求内换号**（账号级错误不留给客户端重试） |
+| R30/R32 | 不自动化「伙伴/群聊」任务；不模拟 App 登录（跨端伪装风控风险高） |
+| R31 | 每日登录积分走 `daily_login_score`（幂等，`10001 今日已领取` 是正常语义） |
+| R34 | **新增渠道必须补 `go xxxSch.Run(sctx)`**，否则自动签到/保活静默不运行 |
+| R35 | 流式请求必须用独立的 `StreamHTTP`（**不设** `Client.Timeout`） |
+| R36 | 流被截断不得补 `[DONE]` 伪装正常收尾 |
+| R37 | TraeWork AuthCode 4xx 属终态（不换 origin 掩盖首因）；设备号作用域 = 账号 |
+| R38 | 上游**按模型**限流时不得软化整个账号（→ `ErrSoftRate` 模型级冷却） |
+| R39 | `scheduler.Config` 时间字段：`nil`=未配置落默认，`[]int{}`=本渠道无此类定时任务 |
+| R40 | 流内业务错误不得伪装正常收尾；兼容层不得吞 error 帧（协议枚举合规） |
+| R41 | 小浣熊协议回调须由 `main.go` 初始化前拦截（`--raccoon-callback`） |
+| R42 | 本地模型校验取「静态表 ∪ 动态目录」并集 |
+| R43 | `stats`（运行统计）与 `ledger`（用量流水）是**两套并列口径**，不合并不互校 |
+| R44/R67 | 小浣熊登录走网页版 CDP 捕获（迁站后 cookie 名 `xhx_token`） |
+| R45 | 明细与刷新路径同源回写 pool 快照（`creditSnapshot`） |
+| R46–R47 | Cline 渠道（`sk_` Key 池 + 免费模型）；429 分两类，共享上限**不得**软化账号 |
+| R48 | assistant 补 `content:""` 不再以 tool_calls 为前提（治 4001 中毒历史） |
+| R49 | **思考档位只透传上游声明，绝不编造** |
+| R50 | 思考链死循环检测（`loopguard`）：中断 SSE + **不罚账号** |
+| R51 | OpenRouter 系思考字段归一化到 `reasoning_content` 单字段 |
+| R52/R59 | 模型 ID 拼接规则单一来源（`provider.PublicModelID/SplitModelID`）；Cline 直通 `cline-free/*` |
+| R53/R53b | usage 缓存计量只归一形状不改语义；oczen 会话头须是官方 `Identifier.descending()` 编码 |
+| R54 | 模型降级链：原模型无容量（含整渠道全灭）时触发，不粘滞自动切回，降级必须可感知 |
+| R55 | traework 模型元数据取上游下发；展示字段容错承接（`json.RawMessage`）不拖垮整张目录 |
+| R56 | tool schema `$ref` **全量内联**消毒（moonshot 系对任何保留的 `$ref` 都不认账） |
+| R57 | 代理改为「**全局备用上游通道**」：默认不参与任何请求，仅渠道按需取用（cline/oczen） |
+| R58 | 流被截断必须**自证原因**（空闲看门狗 vs 上游断连）；`stream_idle_seconds` 配置项从未存在 |
+| R60 | 单号渠道 402 处置 = **模型级**冷却（非账号级、非纯透传） |
+| R61 | 模型降级链必须在**启动时**载入（不得只靠面板热更新通道） |
+| R62 | oczen 同接备用通道；编排抽到 `backuplink.Replay` 与 cline 共用 |
+| R63 | 思考强度映射是「出站注入」，与 R49「只透传声明」互补 |
+| R64 | 面板「测试」类探针必须与真实请求**同源**取用备用通道，并如实回传实际出口 |
+| R65 | 小浣熊「每日积分」是惰性落账，签到 = 调一次 `setting_info`；判据用 `point_grant_popups` |
+| R66 | 自定义 OpenAI 兼容渠道（`custom_channels`）：面板配置即接入，统一流水/统计/路由；**无积分概念**，全面退出积分体系（v2.8.1：RefreshAll 跳过、单账号刷新/明细明确报「不适用」、前端动态判定隐藏无意义按钮） |
+| R68 | **启动时 HTTP 监听失败必须终止进程**（不得只记日志继续跑） |
+| R69 | oczen 匿名车道走 `/inference/v1`；不发 `x-opencode-request`；`x-opencode-project` 用裸 40 位 hex |
+| R70 | 华为云果办 OfficeAce：双层凭据（网关 Basic 不过期 + 临时 AK/SK ~2h 需 refresh 续期） |
+| R71 | WorkBuddyAI 对话出站必带会话头族（缺 `X-Conversation-ID` 即 `400 11-128`） |
+| R72 | devdump 落盘必须 tee 流式（不得 `io.ReadAll`）：读全量再转发会把 SSE 攒批成「正文突然整段出现」 |
+| R73 | 硬冷却（402）必须截到「下一个每日发奖窗口 + 缓冲」：qwenwork 每日 00:00 发额度（实测 00:01~00:20 到账），固定 12h 会把 19:07 的 402 白锁到次日 07:07 |
+| R74 | 内建渠道扩到 20 条（Kilo/MiniMax/LobsterAI/ZCode/Gemini/CodeArts）；CodeArts 无上游身份字段 ⇒ 用户指定「账号标识」复用 UID |
+| R75 | 429+code 14018（积分耗尽）归 `hard_credit`；候选耗尽时可在**请求内**按降级链重入一次（封顶一次、单账号豁免） |
+| R76 | 登录态失效走可自愈的 `SessionDead` 标记（不 `Disable`）；重登后按 auth 文件 mtime 自动清除标记 |
+| R77 | 上游声明可重试的 429（14003 瞬时拥塞，retry_policy.retry / actions 含 RETRY）必须请求内重试一次（独立预算，20s 退避）；6004 用量配额无信号，维持冷却到重置点 |
+| R79 | **目录/费率接口遇 HTTP ≥400 必须返回类型化 `*provider.Error`**（裸 `fmt.Errorf` 会让 `errors.As` 取不到分类 ⇒ 模型面/费率面的 401 自愈永不生效） |
+| R80 | **折线图的 0 值必须画成 `null` 断点**（画成 0 会在底部连出贴轴长线），并过滤「区间总量为 0」的系列；`connectNulls:false` |
+| R81 | **自定义渠道独立成一级弹层**（主面板第 18 个按钮）+ **模型一键导入**（拉 `/models` 勾选批量加）；设置弹层里已移除该节 |
+| R82 | **自定义渠道一行式列表 + 新增/修改全走弹窗**（渠道/模型/单模型三层）+ **下拉框 `appearance:none` 自绘箭头** |
+| R83 | **模型与 provider 同行展示**（chip 是文字按钮，点开编辑）+ **删除改文案按钮**（不用 🗑/×）+ **移除「停用」概念**（`enabled` 字段删除） |
+| R84 | **弹窗宽度统一三档**（400/720/1180，禁止第四档）+ **自定义渠道搬回设置弹层**（独立弹层只是绕过「设置太窄」的伪问题）+ 设置加吸顶跳转条 |
+| R85 | **自定义模型改独立弹窗**（设置里只留入口按钮）+ **Provider 一行、其下每个模型各一行**，两类行都 `nowrap`（折行用横向滚动替代）；R83「模型与 provider 同行」被推翻，删除改文案/移除停用保留 |
+| R86 | **设置弹层宽度回原样（720px）** + **自定义模型入口移到主工具栏「＋ CodeArts」右侧**；删掉 R84 的吸顶跳转条（搬走那块后失去理由） |
+| R87 | **自定义模型弹层与设置同宽（720px）** + **去掉「测试」** + **每行按钮组整体右对齐**（信息区 `flex:1` + 按钮组 `margin-left:auto`，不是上下按列对齐） |
+| R88 | **自定义模型弹窗深度统一项目原生风格与对齐修复**：Provider 行移除 `<div class="cm-actions">` 彻底修好按钮右对齐 Bug；底栏操作并列右下角；视觉设计全面回归项目原生 CSS 变量与设计令牌（标准 `.hint`、`.btn.small` 与从属树线），危险按钮改柔和描边消除刺眼红斑，与全局面板浑然一体 |
+| R89 | **设置弹窗视觉细节规整化**：表单 Label（90px）与子行（98px）严格缩进对齐；签到时间改流式容器化，时间 chips 与「＋ 时间」按钮同高紧凑排列（消除加号孤立掉落缺陷）；开关行垂直居中规整化；滚动条极细化 |
+| R90 | **弹窗长篇说明文字角标化（`?` 悬浮说明）**：自定义模型与设置弹窗中原占用大篇幅排版的说明段落收敛为右上/行内 `?` 角标（`.help-mark`），鼠标悬停（hover）展示带透明衔接桥的自适应浮动气泡（`.help-pop`，支持 rich text），消除长文本挤占纵向空间并提升表单通透度 |
+| R91 | **修复设置内点「查询模型」导致设置弹窗消失 Bug**：移除 `openModelSearch` 误收起设置的逻辑；`modelSearchOverlay` 设为独立高层（`z-index: 120`），打开时以浮层叠加在设置上方，关闭后自然回到设置原位置，已填表单与滚动状态完全保留；补全标题右上角 `✕` 关闭按钮与 Escape 监听 |
+| R92 | **设置面板降级链与思考强度编辑区视觉精细化重构**：① 标题区使用 flex 排序，使 `?` 角标紧随区标题（左侧），「🔍 查询模型」从虚线框升级为实线胶囊操作按钮（右侧）；② 修复全局默认输入框 `.grow` 坍缩截断 Bug，自适应撑满行宽；③ 降级链与思考强度规则录入区封装为独立 `.fb-compose-panel` 浅底卡片，操作区边界清晰；④ 空态提示升格为轻柔虚线卡片，已生效代理采用绿点徽标（`● 已生效`） |
+| R93 | **修复降级链与思考强度输入框点击下拉菜单缺失 Bug**：① 修复 style.css 中注释意外闭合导致的 CSS 语法破坏，恢复 `.pk-wrap` 相对定位与 `.pk-menu.open { display: block }` 核心样式，并提级 `z-index: 100` 消除层叠遮挡；② 补充输入框 `"click"` 事件监听，使输入框已获焦点时再次点击亦能即刻唤起候选菜单；③ 设置打开时若费率未就绪自愈触发 `loadFees()` |
+| R94 | **模型降级链 = 模型维度的替换机制**，只在「换号已用尽」后出手；三维归因（账号/模型/请求）对应四类处置（request / account-transparent / account-rotate / model），同维替换、跨维禁止；**模型饱和（14003/6004）与积分耗尽（14018）同属「值得请求内换模型」**，且请求内重入**只跨渠道**（同渠道兄弟模型共享同一批账号）；详见 [`docs/模型降级链定义.md`](docs/模型降级链定义.md) |
+| R95 | **Qoder 双区签到：活动资格是上游按账号授予的**（实测：同账号在官方客户端里同样看不到入口）⇒ 无资格必须直说「该账号无资格、不是本工具的问题」，不得含糊成「上游未下发」；**且按活动 `startAt/endAt` 有效窗口过滤**（窗口外不参与「可领/已领」判定，缺字段则不过滤）；面板结果分「领到 / 已领 / 还没发 / 失败」四档，**不得一律写「签到成功」**（详见 `docs/决议项.md`） |
+| R96 | **账号登录态失效必须可被用户看见与修复：`session_dead` 是「可自愈标记」不是「禁用」，且签到失败必须如实反映（R76 的落地补强）**——① `RecordCheckin` 的 map 查找变量不得叫 `ok`（遮蔽函数参数会让 `last_checkin_ok` 恒真、每次都清掉 `session_dead`、`else if sessionDeadLike` 成死代码）；② `MarkSessionDead` 已标记时**更新原因但保留时间锚**（时间锚是「重登后自动清除」的判据）；③ CodeArts 这类**回调写死回环**的渠道要做异地登录兜底 |
+| R97 | **LobsterAI 异地登录：上游 portal 只认 `http://127.0.0.1:<port>/auth/callback`（hostname 严格等值，否则丢弃并改发 `lobsterai://` deep-link）⇒ 改 redirect host 到 LAN IP 无效（已实测并回滚，留护栏测试）**。可行方案：① 面板「粘贴回调地址」（`SubmitCallbackURL`，与自动回调同一结论通道、state 不放宽）；② 全自动 = 固定端口（`config.login.lobsterai_callback_port`）+ 浏览器侧 `ssh -L` 端口转发（本机已装 `ww-lobsterai-tunnel.service`，38055）；③ 局域网模式下不得因错 state 写终态（防 DoS）已随方案 ② 一并回滚，因为监听仍只绑环回 |
+| R98 | **用量折线图的横轴必须是「固定整窗刻度」**：`days=1` ⇒ 00:00~23:00 共 24 个小时桶，`days>1` ⇒ 窗口内每天一个（**含无流水的空桶**）。不得按「当前几点」或「只有数据的时段」截断——旧实现 `for h := 0; h <= now.Hour(); h++` 让今日视图在 11 点只画到 11:00，横轴长度随时刻变化、刻度本身也在变，既无法横向比较也看不出「后面还没跑」；积分图更严重（自己按流水聚合，横轴只有有消耗的日子）。补桶是**后端唯一来源**（`ledger.Query`），前端只消费 `by_day`；积分图用 `usageAxisKeys(usageDays)` 对齐同刻度 |
+| R99 | **渠道配色必须单一来源**：`:root` 的 `--ch-<类名>` 是唯一真源，`.badge.x` 一律 `var(--ch-x)`（**禁止写死 hex**），徽章统一走 `chBadge()`（底色 = `chColor()`，与折线图 series 同源，物理上无法漂移）；**新增渠道必须同时补 `--ch-<类名>`**，漏加会让 `chColor()` 静默回退 `#6366f1` ⇒ 多个渠道在图上撞成同色（10-17 连加 6 个渠道时就踩了）。自定义渠道无品牌色，按列表序号黄金角均分色相（不用固定色池，色池在渠道数超过池长时必撞）。**已知限制（实测，未修）**：master 走品牌色路线，两两辨识度靠「无完全同色」把关，**未做 CIEDE2000 校验**——实测最小 ΔE2000 = 6.9（loomy vs minimax），共 15 对 <14；`.badge` 文字色恒为白，traecode（4.1）/raccoon（3.79）白字对比度低于 WCAG AA 的 4.5。要收紧就得改色值，需先做视觉评估。**完整规范见 [`docs/渠道配色规范.md`](docs/渠道配色规范.md)**（色值基线表 + 新增渠道必补三处 + 变更流程；`ui-static-check` 逐值比对文档与 `:root`，改色不同步文档即测试失败） |
+| R101 | **积分流水差分必须区分「池子缩水」与「用掉更多」**：`remain = total - used` ⇒ `Δremain = Δtotal - Δused`。旧实现只比 remain，「余额下降 + 无到期日」恒记 spend ⇒ QoderCN 一个 100 分包整包到期（带走了包内已用 1 分后剩的 99）被面板显示成「今日消耗 99」（2026-10-19 用户实测，当天真实调用只有 1 次 480 token，上游 quota 实测 `used` 反而从 1 归零）。修法：快照新增 `t`(total)，下降时多一道 `poolShrankExpiry` 判据，三门槛缺一不可——① 该条目无到期日（有到期日的渠道继续走 `expired()`，那一路本来就对）；② **该渠道**被证实会给 total/used 分别赋值（`channelBooksUsage`，持久化为快照 `"@ch/<channel>"` 标记；qwenwork/raccoon/minimax/monkeycode/loomy/glm 六个渠道 `Total=Remain`、`Used` 恒 0，无此门槛会把它们的真实消耗全记成过期。**必须按渠道判、不能按 key/账号判**：只签到不花钱的号 `used` 恒 0，按 key 判会把它的整包到期漏修）；③ `total` 确实下降且上次快照有 total（老快照无 `t` 字段 = 零值 ⇒ 自动退回旧口径，不改写历史归因，符合不变量 5）。详见 [`docs/决议项.md`](docs/决议项.md) |
+| R102 | **「今日作废」必须是平台表的一等列，不能只藏在合计行 tooltip 里**：`credit_expired`（往回看：今天已经到期消失的额度）与 `expire_today`（往前看：今晚余额里还有多少会没）是**相反方向**的两个口径，混成一列会把「已经没了」说成「还没发生」。R100 补删掉顶部汇总横条时把唯一可见的「今日作废」一起删了，只剩合计行「今日消耗」的悬浮说明里带一句，等于不可见（2026-10-19 用户实测：「今日作废在哪看？」）。修法：平台表在「今日消耗」右侧加 `st-plat-expd` 列，逐渠道取 `platforms[].credit_expired`、合计行取顶层 `credit_expired`，配色用 `--danger` 与「今日消耗」的 `--warn` 区分。`ui-static-check` 里把 `FAKE_STATS` 的 `expire_today` 从 100 改成 77——两者取同值时断言无法分辨口径是否被接错（变异验证实证：同值时漏改 `credit_expired→expire_today` 不报警） |
+| R103 | **「不适用」账号默认收起，但入口必须留在原地且一键可逆**：无积分概念的渠道（oczen/kilo/cline/自定义渠道）在账号页上每号占一整张只有「不适用」三字的卡片、汇总条上还各占一枚同样空洞的 chip，把真正有余额的渠道稀释掉（2026-10-19 用户：「把不适用的默认隐藏掉，但有时候又得看一下」）。修法：① 判据只用后端下发的 `credits_na`（`isNoCreditAcct`），**不在前端另维护渠道名单**——自定义渠道是运行期可增删的，手写名单必漏收起；② 汇总条收起这些 chip，改在**原位**放一枚「不适用 N号 展开/收起」开关 chip（不额外占工具栏一格）；③ 账号卡片在 `renderAccounts` 里就带 `hidden`（首帧不闪），并带 `data-na` 供 `applyAcctFilter` 二次过滤；④ `toggleNoCredit` 必须**重渲染卡片**而不只改 class（可见性只有 `naHiddenClass` 一个真相，两处各写一份必漂移）；⑤ 收起时若正筛选着某个「不适用」渠道必须自动清筛选，否则网格空白且「全部」chip 也随汇总条消失；⑥ 选择持久化 `localStorage["acct-show-na"]`，全部被收起时给 `#acctHiddenTip` 可执行提示。`ui-static-check` 新增场景 1.7（13 条断言），4 处变异（默认展开 / 去 `data-na` / 不重渲染 / 不清筛选）全部确认变红 |
+| R104 | **回环回调渠道跨机登录 = 五渠道统一人工粘贴兜底；CDP 浏览器化已回滚**：traework/codearts/lobsterai/qwenwork/gemini 的回调写死回环，dashboard ≠ 网关机时唯一通用解是把浏览器地址栏 URL 粘回面板（`manualCallbackKind` 白名单单一来源，qwenwork/gemini 的 `SubmitCallbackURL` 本轮补齐）。CDP 方案（网关机拉浏览器+捕获导航）已完整实现后实测回滚——只解决「人在网关机前」，对主流的远程 dashboard + 无人值守网关无解。**跨机方案动手前必须先确认「人在哪台机器前」**。详见 docs/全渠道登录授权方式梳理.md §4 |
 
-- 单击/双击/右击：右击弹菜单；**单击与双击 = 打开主界面**
-- 各菜单项使用不同颜色纯 Go 生成图标（蓝色=打开、灰色=日志、红色=退出）
-- 刷新积分功能已移至 Web UI 面板操作
+> ⚠️ **R71 附带的实测纪律**（也是 §0.1 的来源）：上游校验的是**头族齐全**而非单点
+> （只补 `X-Conversation-ID` 仍被拒）；且 `X-Conversation-ID` 的**取值形态不被校验**
+> （UUIDv4 / 32hex / 裸串都通过）。
 
-## 4. Web UI 页面规划（纯静态，一个 index.html + app.js + style.css）
+---
 
-| 页面/区块 | 内容 |
-|-----------|------|
-| 顶部栏 | 品牌名/版本号、API 地址（点击弹窗配置）、API-Key（点击弹窗修改）、帮助/关于 |
-| 登录层 | 启用管理密码时先登录（HttpOnly cookie 会话）；设置弹层内置「退出登录」 |
-| 账号管理 | 双列卡片网格，账号名/UID/积分/签到状态，图标按钮操作（签到/刷新/停用/删除）；顶部积分汇总条 chip 可点击筛选（PR #68） |
-| 自动签到 | 签到时间（HH:MM 多组）+ 开机自启开关（左右布局） |
-| 用量与流水 | token 与积分流水（ledger 口径，R17）；token / 积分两个子 tab |
-| 费率 | 各渠道模型定价表（按渠道分组），渠道标签带余额角标、模型名点击复制（PR #69） |
-| 运行统计 | 实时统计（stats 口径，R43）：今日情况 / 平台概览 / 使用中接棒 / 最近临期 / 模型消耗 / 请求日志 / 异常账号 / 运行日志，30s 轮询 |
+## 2. 关键不变量（改动前必读）
 
 管理 API（REST，均挂 `/api/*`；除 `/api/auth/*` 外均需有效面板会话——密码为空时不校验）：
 
@@ -216,7 +278,7 @@ POST /api/quit                     # 退出程序
    `dist/` 在 `.gitignore` 中，CI 只产出带平台后缀的 `workbuddy-api-<os>-<arch>`，
    **不会**生成 `dist/workbuddy-api.exe`——该文件只能手动构建。
    不重建会导致：本地运行的二进制与源码不一致（例如改了版本号但仍显示旧版本）。
-1. `PrepareBody` 三改写勿动：强制 `stream=true`、`tool_choice` 归一化、`developer→system`
+1. `PrepareBody` 四改写勿动：强制 `stream=true`、`tool_choice` 归一化、`developer→system`、tool schema `$ref` 消毒（R56，无 `$ref` 时零改动）
 2. 日志/面板/消息框**零 token**：不得输出 access/refresh token（调试用假 token）
 3. auth 文件嵌套格式 `{auth:{...},account:{...}}`，`internal/auth.Parse` 与 login.SaveAuth 必须一致
 4. `config.listen` 兼容新对象格式 + 旧字符串格式 `":7863"`
@@ -248,10 +310,18 @@ POST /api/quit                     # 退出程序
     TraeWork 是 `expire_time`（Unix 秒），Qoder 无此字段。均按 **UTC+8 墙钟**解析（`softRateResetLoc`），
     用 `time.Local` 会在非 UTC+8 机器上算错一天。上游未下发时 `ResourceItem.ExpireAt` 必须为空串，
     前端据此隐藏整列——**不得用零值时间冒充「永不过期」**。
+    - **两种写法并存，消费方必须同时支持**：`YYYY-MM-DD`（该日**全天可用**，次日 00:00 起失效；
+      全仓主口径，当日有效池走 `provider.ExpireDateToday()`）与 **RFC3339**（精确时刻，如 gemini 的
+      5 小时/周配额窗口重置）。判定统一走 `provider.ExpireInstant`（是否已失效）与
+      `provider.ExpiringWithin`（是否临期），**不要各自 Parse**——旧实现各处自解析且吞掉错误，
+      RFC3339 的条目被静默当成「永不过期」（2026-10-18 核对）。
 19. **401 必须自愈，不能只信本地 `expiresAt`**：上游刷新会作废旧 access token（refresh token 同步轮换）。若新 token 未落盘、
     或同一账号在别处被刷新，本地文件里的 token `expiresAt` 仍在未来，但上游已拒绝 → `NeedsRefresh` 恒为假、永不刷新、
     积分恒 0、明细恒空。因此积分/明细/费率路径遇 `ErrSessionDead` 必须「refresh + 落盘 + 重试一次」
     （`app.refreshIfSessionDead`，scheduler 的 checkin 路径同理）。
+    - **上游错误必须类型化**：自愈链全靠 `errors.As` 取 `*provider.Error` 判 `Kind`。
+      目录/费率接口曾用裸 `fmt.Errorf` ⇒ 模型面与费率面的 401 自愈**永远不生效**（R79）。
+      新增任何上游调用时，≥400 一律返回 `&provider.Error{Kind: Classify(...), …}`。
 20. **凡是调 `Upstream.RefreshToken` 的地方必须紧跟 `SaveAtomic`**：refresh token 会轮换，不落盘 = 下次启动用旧 refresh token，
     重回上一条的死锁（`RefreshPricing` 曾漏，已补）。
 21. **虚拟账号/单账号渠道不得进入任何「能把它弄没」的路径**：`reloadAccounts` 不纳入（`SyncToDir` 会剔除），
@@ -283,8 +353,42 @@ POST /api/quit                     # 退出程序
       直到全部账号达 `claimed`/`already` 才算当日完成（上游 `ae3d42f` 修的就是漏领一天）。
       完成标记按「日期+时段」而非仅日期——本工具支持一天多时段（09:00/21:00），
       只按日期标记会让早间成功吞掉晚间时段。
+24. **缓存字段是「可选上报」，不得把「不提供」显示成『0%』**：上游 usage 里是否回缓存命中字段
+    因渠道而异（实测：WorkBuddy 系 `prompt_cache_hit_tokens`、Trae 系 `cache_read_input_tokens`、
+    其余 `prompt_tokens_details.cached_tokens`；小浣熊回**空对象**、清言/Loomy 整条流无 usage）。
+    判定集中在 `internal/server/cacheusage.go`，必须区分两种情形：
+    - 「字段存在但为 0」（如 `prompt_cache_hit_tokens:0`）= 上游明确的「本轮未命中」⇒ 显示 0%；
+    - 「字段不存在 / details 为空对象」= 上游不提供该维度 ⇒ 显示「—」，**绝不得显示 0%**。
+    落地细则：`UsageEntry.CRC` / `ModelStat.CRCov` / `TokenStats.CRCov` 为零即代表「无样本」；
+    利用率 = `CR ÷ CRCov` 的**加总口径**（未上报的请求整条不进分母，不稀释命中率）；
+    三个字段一律 `omitempty`，保证旧流水读出来就是「未上报」（不变量 5 的向后兼容落地）。
+    **分母不得做 `PT + cacheRead`**：实测 workbuddy 系 `hit+miss==prompt_tokens`、
+    trae 系 `total==prompt+completion` ⇒ 命中数是 prompt_tokens 的**子集**（与 Anthropic
+    官方口径相反）。副产品：利用率恒 ∈ [0,1]。回归测试 `internal/server/cacheusage_test.go`、
+    `internal/ledger/cache_test.go`、`internal/stats/cache_test.go`、`scripts/ui-static-check.mjs`。
+    **唯一会重建 usage 的渠道是 monkeycode**（只拼 pt/ct/total）⇒ 搬字段必须显式加，
+    否则上游给的缓存数据在网关内部就被丢掉（本项就是它被发现的原因）。
 
-## 7. 平台能力差异表（internal/platform）
+---
+
+## 3. 架构与渠道（摘要）
+
+**架构选型**：
+
+| 主题 | 选型 | 理由 |
+|------|------|------|
+| GUI 壳 | **无**（删除 wails） | WebView2 内存开销大 + Windows 绑定；托盘 + 浏览器足够 |
+| 托盘 | energye/systray v1.0.3 | 已跨平台；菜单固定方案规避其不可删菜单项限制 |
+| 管理后端 | 现有 http.Server 扩展 `/api/*` | 单端口、复用鉴权中间件（cookie 会话守卫）、零新服务 |
+| Web UI | 纯静态 embed + fetch | 无 Node 构建链，单 exe 双击即用 |
+| 登录 | `internal/login` + `login_*` | 纯 HTTP + 本地回调端口（或 CDP 捕获），跨平台 |
+| 平台能力 | `internal/platform` + build tag | 浏览器无痕/开机自启/消息框/日志/工作区，接口同名 |
+| 构建 | WSL 交叉编译 win；CI macos-latest 编 darwin | 见 R11 |
+
+**托盘菜单**（固定，不做动态内容）：`打开主界面` / `查看日志` / `退出`；
+单击与双击 = 打开主界面；各菜单项用不同颜色纯 Go 生成图标。
+
+**平台能力差异表**（`internal/platform`）：
 
 | 能力 | Windows | macOS | Linux |
 |------|---------|-------|-------|
@@ -295,10 +399,35 @@ POST /api/quit                     # 退出程序
 | 确认框 | MessageBoxW YESNO | osascript buttons | 默认否 |
 | 无头模式 | --no-tray | --no-tray | --no-tray（推荐） |
 
-## 8. 构建
+**面板区块与 API 全量清单**见 [`docs/接口参考.md`](docs/接口参考.md)。
 
-> ⚠️ **本地构建是日常约束**：任何代码变更后都要重新构建 `dist/workbuddy-api.exe`
-> （见 §6 第 0 条）。CI 不生成该文件，且 `dist/` 不入版本控制。
+### 渠道清单（20 条内建 + 自定义）
+
+WorkBuddyCN（`workbuddy/*`）、WorkBuddyAI（`workbuddyai/*`）、TraeWork（`traework/*`）、
+TraeCode（`traecode/*`）、QoderCN（`qodercn/*`）、QoderCOM（`qodercom/*`）、
+千问办公（`qwenwork/*`）、MonkeyCode（`monkeycode/*`）、小浣熊（`raccoon/*`）、
+Loomy（`loomy/*`）、智谱清言（`glm/*`）、OpenCodeZen（`oczen/*`，匿名）、
+Kilo（`kilo/*`，免密免费池、无账号）、MiniMax Code（`minimax/*`，设备码授权）、
+LobsterAI（`lobsterai/*`，本机回调授权）、ZCode（`zcode/*`，设备授权；积分领取依赖网页验证码，本工具不自动领取）、
+Gemini（`gemini/*`，本机回调授权）、CodeArts（`codearts/*`，PKCE 授权）、
+Cline（`cline-free/*`）、华为云果办 OfficeAce（`officeace/*`）；
+另有用户自定义 OpenAI 兼容渠道（`custom_channels`，R66）。
+旧 Qoder（`qoder/*`）已从界面下线，路由保留。
+
+**新增渠道步骤**：① `internal/<channel>/` 实现 `provider.Upstream`；
+② `internal/auth` 加 `Load<Channel>Dir()`（注意 glob 边界：`qoder*.json` 会吞 `qodercn-`/`qodercom-`）；
+③ 注册 `server.Runtime` + `app.Runtime`；④ 前端渠道选择器加项 + `internal/login_<channel>`；
+⑤ **`go xxxSch.Run(sctx)`**（R34，漏了会静默不跑）；⑥ 补回归测试。
+> 无账号渠道（oczen / kilo）跳过 ②④，虚拟账号由 `main` 装配时注入。
+
+**各渠道协议要点、凭据模型、已知限制与踩坑**见 [`docs/渠道接入备忘.md`](docs/渠道接入备忘.md)。
+
+---
+
+## 4. 构建与发版
+
+> ⚠️ **本地构建是日常约束**：任何代码变更后都要重新构建 `dist/workbuddy-api.exe`（见 §2 第 0 条）。
+> CI 不生成该文件，且 `dist/` 不入版本控制。
 > 标准流程：`go build ./... && go vet ./... && go test ./...` 全绿后再构建。
 
 ```bash
@@ -316,31 +445,30 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/workbuddy-api-linux ./cmd
 
 ```bash
 # Windows bash 下用 python 字节计数（strings 对 Go 二进制的长串不可靠）
-python -c "b=open('dist/workbuddy-api.exe','rb').read(); print('new:',b.count(b'2.5.3'),'old:',b.count(b'2.5.2'))"
+python -c "b=open('dist/workbuddy-api.exe','rb').read(); print('new:',b.count(b'2.8.0'),'old:',b.count(b'2.7.3'))"
 # 期望：new >= 1 且 old == 0。若旧版本号仍在，说明构建未生效。
 ```
 
 ### 发版（tag 触发）
 
 push `v*` tag → GitHub Actions 构建五平台产物并创建正式 release。
-**release note 用仓库根目录的 `RELEASE-<tag>.md`（手写摘要，面向用户）**，
-而不是 `--generate-notes`（那只给 commit 链接列表）；文件缺失时回退自动生成，不阻塞发版。
+**release note 用仓库根目录的 `RELEASES.md`**（按版本从旧到新排列，新版本说明**append 到文件末尾**）。
+CI 从 `RELEASES.md` 截取对应版本段落（`# workbuddy-api vX.Y.Z` 起）作为手写摘要，
+而不是 `--generate-notes`；段落缺失时回退自动生成，不阻塞发版。
 
 ```bash
 # 发版前确认：版本常量已 bump（internal/app/app.go const Version）、
-# RELEASE-vX.Y.Z.md 已写好且与 tag 名一致、dist/workbuddy-api.exe 已本地重建验证
+# RELEASES.md 末尾已追加对应版本段落（# workbuddy-api vX.Y.Z）且与 tag 名一致、
+# dist/workbuddy-api.exe 已本地重建验证
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-## 9. 文档索引
+> **重发同一版本**：`gh release delete <tag> --yes --cleanup-tag`（或 API 删 release + 删 tag）
+> → 重打 tag 指向新提交 → 推送。CI 的 `gh release create` 遇到已存在的 tag 会失败，**必须先删干净**。
 
-入库文档（`docs/` 白名单制下反选入版本控制）：
+---
 
-- [README.md](README.md) — 用户文档
-- [DEVELOPMENT.md](DEVELOPMENT.md) — 开发者文档（面向 AI Agent）
-- [AGENTS.md](AGENTS.md) — 本文件：决议项（R1–R43）、架构选型、不变量
-- [docs/三接口兼容改造备忘.md](docs/三接口兼容改造备忘.md) — 三接口（Chat/Responses/Anthropic）兼容层架构决策、实施记录、验证清单、已知限制
-- [docs/用量积分流水记账备忘.md](docs/用量积分流水记账备忘.md) — 双流水统计（token/积分）架构、差分算法、实测验证、已知限制（R17）
+## 5. 开发期上游取证（devdump）
 
 以下备忘被 R16 / 不变量 22 / 不变量 23 等决议引用，但**尚未入库**（`.gitignore` 白名单未反选，仅本地可见）：
 `internal/server/handler.go` 的 `Runtime.SingleAccount` 分支、`internal/qwenwork/`、`internal/qodercn/`、
@@ -351,7 +479,21 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 [glm2api](https://github.com/ttales430/glm2api)（签名算法/认证流程/SSE 语义/积分机制/智能体清单），
 引用一律指向该仓库，不要找本地文件。
 
-> **docs/ 采用白名单制**：`.gitignore` 中 `docs/*` 默认忽略全部文档，仅 `!docs/<文件名>` 显式反选的才入库。
-> 逆向分析类文档一律**只保留本地、不入库**。新增需要入库的文档时，追加一行 `!docs/<文件名>`。
-> 未入库的本地文档（`ref/`、`docs/` 其余文件、`HANDOFF.md`、`GO多平台发布备忘.md` 等）仅供本地参考，
-> 不要在本文件中作为可点击链接引用。
+### 6.1 docs/ 白名单制规则
+
+`.gitignore` 中 `docs/*` 默认忽略全部文档，仅 `!docs/<文件名>` 显式反选的才入库。
+
+- **新增需要入库的文档时，必须同时做两件事**：① 在 `.gitignore` 追加一行 `!docs/<文件名>`；
+  ② 在 §6 的表格里加一行链接。
+- **验证入库状态**：`git check-ignore -v docs/<文件名>`（无输出 = 已入库；有输出 = 仍被忽略）。
+  或 `git ls-files docs/` 查看实际入库清单。
+- **`AGENTS.md` / `README.md` / `DEVELOPMENT.md` 中所有 `.md` 链接都必须指向已入库文档**，
+  否则他人克隆仓库后会看到死链。提交前用下面这条自查：
+
+```bash
+# 只取 markdown 链接目标（]（docs/xxx.md））——不要把反引号里的"未入库文档"也算进来
+rg -o '\]\((docs/[^)]+\.md)\)' -r '$1' AGENTS.md README.md DEVELOPMENT.md \
+  | sort -u | while read f; do
+  git check-ignore -q "$f" && echo "❌ 未入库（死链）: $f" || echo "✅ $f"
+done
+| R105 | **到期判定必须按「精确时刻 + 自然日」，「到期日字符串比大小」是错的**：七个渠道把上游到期时刻截成 `YYYY-MM-DD`（qwenwork `valid_to`、traework `expire_time`、workbuddy `CycleEndTime`、lobsterai/officeace/zcode 的日期串），面板再拿日期字符串比 `today`/`tomorrow`。后果有两个：① 上游每日类额度的真实形态是**次日 00:00 失效**，截成日期后落到「明日到期」桶，实测 415 分显示「明天到期」而实际只剩 5.7 小时（2026-10-19 用户实测）；② 「7 日内到期」只取**每账号最早到期日那一天**的额度，workbuddy/traework 每账号 20+ 个每日包全被漏掉，真实敞口 4938 分被低估成 1788 分。修法：① 七个渠道的到期值统一改成 **RFC3339 保留时分秒**，`loomy` 上游无到期字段就**留空不伪造**；② 判据收口到 `provider.ExpireBucketOf` / `ExpireWithinDays` / `ExpiringWithinDays`：先 `ExpireInstant` 取精确时刻，减 `expireMidnightGrace`（**5 分钟**，实测上游抖动 0～7 秒）后取**自然日**分桶——**次日 00:00 归今日**；③ `stats` 侧把「每账号最早日+额度」换成**逐条目** `[]ExpireItem`，三个桶逐条目累加；④ 「最近临期」按**剩余时长**升序并显示 `5.7 小时后`（同一天里也要能看出谁先没）；⑤ 临期阈值（设置项 + 调度器）同步改成自然日语义（今天算第 1 天），不用 `now + N×24h`——那个窗口会随设置时的钟点漂移。**伪键必须保持日期粒度**（`provider.ExpireDate`），否则升级瞬间每包产生一对假的 expire+earn 流水。顺带修掉 lobsterai 无时区串按 UTC 解析导致的 8 小时偏差。测试：`TestExpireBucketOf`（19 例边界）、`TestExpireWithinDays`、`TestExpiringWithinDaysSum`、`TestExpireBucketsByInstant`、`TestExpiryRowsHoursLeft`；7 处变异全部确认变红 |

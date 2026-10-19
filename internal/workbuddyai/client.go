@@ -4,6 +4,7 @@ package workbuddyai
 
 import (
 	"bytes"
+	crand "crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -85,6 +86,15 @@ func commonHeaders(req *http.Request) {
 
 // chatHeaders 对话专有头：Authorization 族 + X-No-* 缺省约定。
 // 安全红线：绝不携带 X-Refresh-Token。
+//
+// 会话头族（X-Conversation-*）是上游渠道校验的对象：2026-10-16 起国际版新增
+// 抽样校验，缺会话头族的请求被判「非官方客户端」，返回 400 code=11128
+// "conversation id missing"（displayTips 明示"没通过渠道校验"）。
+// 定位与 A/B 实证（同凭据同 body 只差三个头：缺 X-Conversation-* 恒 400、
+// 带齐恒 200）见 ardeyouxipianyi/workbuddy2api-hub#380（修复 PR #381，对
+// 官方客户端 5.8.4 抓包核验）、CangShui/workbuddy-gateway#20、
+// ithtelab/workbuddy-manager#193。实测只在 body 加 conversationId 无效，
+// 头族才是校验对象（#193）。
 func chatHeaders(req *http.Request, a *auth.Auth) {
 	commonHeaders(req)
 	req.Header.Set("Content-Type", "application/json")
@@ -101,7 +111,10 @@ func chatHeaders(req *http.Request, a *auth.Auth) {
 	}
 	req.Header.Set("X-Domain", wbaiDomain)
 	injectAttributionWBAI(req)
-	// 会话头族
+	// 会话头族。X-Conversation-ID 在官方客户端抓包里是带连字符的 UUID
+	// （v4/v7 均被接受，版本号不参与校验）；其余四个此前已带（32 位 hex），
+	// 形态保持不变。每次请求现生成（对齐 #381 合并版行为，不引入跨请求状态）。
+	req.Header.Set("X-Conversation-ID", conversationIDWBAI())
 	mid := newMessageIDWBAI()
 	req.Header.Set("X-Conversation-Request-ID", mid)
 	req.Header.Set("X-Conversation-Message-ID", mid)
@@ -125,6 +138,27 @@ func newMessageIDWBAI() string {
 		b[15-i] = byte(n >> ((7 - i) * 8))
 	}
 	return hex.EncodeToString(b[:])
+}
+
+// conversationIDWBAI 生成 X-Conversation-ID 的值：随机 UUIDv4（带连字符，
+// 8-4-4-4-12 小写 hex）。官方客户端抓包显示 conversation id 就是这个形态，
+// v4/v7 均被上游接受（#381 实测版本号不参与校验），取实现最简的 v4。
+// 与 newMessageIDWBAI 的 32 位 hex 刻意不同形——两种形态在抓包里并存，
+// 分别对应消息类与会话类 ID，保持各自原貌最不惹眼。
+func conversationIDWBAI() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// crypto/rand 失败时退回时间戳派生（与 newMessageIDWBAI 同源思路），
+		// 仍满足「带连字符 UUID」的形态校验。
+		n := time.Now().UnixNano()
+		for i := 0; i < 8; i++ {
+			b[i] = byte(n >> (i * 8))
+			b[15-i] = byte(n >> ((7 - i) * 8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // billingHeaders 余额 / 签到接口头。
@@ -247,21 +281,32 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 仅传输层失败才返回 err。
 //
 // 对网关类 5xx（502/503/504）与瞬态传输错误做有限重试（见 retry.go）；
-// 4xx 不重试（风控/余额/参数语义，重试无益）。
+// 4xx 不重试（风控/余额/参数语义，重试无益）——**唯一例外是上游显式声明
+// `retry_policy.retry=true` 或 `actions` 含 `RETRY` 的 429**（14003 瞬时拥塞）：
+// 上游自己说可重试，此时直接抛错并让上层罚号，会把一次可自愈的抖动放大成渠道级 503。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	prepared := PrepareBody(body)
+	rateLimitRetries := 0
 	for attempt := 1; attempt <= retryMaxAttempts; attempt++ {
 		rc, status, respBody, err = c.chatStreamOnce(a, prepared)
-		// 成功或 4xx：直接返回，不重试
-		if err == nil && !retryableStatus(status) {
-			return rc, status, respBody, nil
-		}
-		// 传输层错误：仅在可重试时继续
-		if err != nil && !retryableErr(err) {
-			return nil, 0, nil, err
+		ok, isRateLimit := retryDecision(status, respBody, err)
+		if !ok {
+			return rc, status, respBody, err
 		}
 		if attempt == retryMaxAttempts {
 			break
+		}
+		if isRateLimit {
+			// 收紧的独立预算：只重试一次，且不占用 5xx 的重试额度。
+			// 429 频繁重试有风控风险，宁可少试也不能刷屏。
+			rateLimitRetries++
+			if rateLimitRetries >= rateLimitMaxAttempts {
+				break
+			}
+			log.Printf("workbuddyai chat_stream uid=%s: 上游 429 显式声明可重试（retry_policy.retry / actions 含 RETRY），%v 后重试 (%d/%d)",
+				a.UID, rateLimitBackoff.Round(time.Millisecond), rateLimitRetries, rateLimitMaxAttempts-1)
+			time.Sleep(rateLimitBackoff)
+			continue
 		}
 		why := fmt.Sprintf("http %d", status)
 		if err != nil {
@@ -332,7 +377,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			continue
 		}
 		seen[m.ID] = true
-		out = append(out, provider.ModelInfo{
+		mi := provider.ModelInfo{
 			ID:            m.ID,
 			Name:          m.Name,
 			ContextWindow: m.MaxInputTokens,
@@ -343,7 +388,19 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			SupportsImages:    m.imageOK(),
 			SupportsReasoning: m.SupportsReasoning,
 			SupportsTools:     m.SupportsToolCall,
-		})
+		}
+		// 思考档位（issue #96）：目录 reasoning 对象原样透传，缺失不编造
+		if m.Reasoning.hasReasoningMeta() {
+			r := m.Reasoning
+			mi.ReasoningEfforts = provider.CleanEfforts(r.SupportedEfforts)
+			mi.DefaultReasoningEffort = strings.TrimSpace(r.DefaultEffort)
+			if mi.DefaultReasoningEffort == "" {
+				mi.DefaultReasoningEffort = strings.TrimSpace(r.Effort)
+			}
+			cd := r.CanDisableThinking
+			mi.CanDisableThinking = &cd
+		}
+		out = append(out, mi)
 	}
 	// 硬编码补入目录外可用模型
 	for _, m := range extraModels {
@@ -494,24 +551,36 @@ func (c *Client) userResource(a *auth.Auth) (int64, []provider.ResourceItem, err
 			Used:     used,
 			Remain:   remain,
 			ExpireAt: expireDate(acct.CycleEndTime),
-			// 套餐名+到期日组合伪键（同国内版口径）
-			Key:    fmt.Sprintf("%s|%s", acct.PackageName, expireDate(acct.CycleEndTime)),
+			// 套餐名+到期日组合伪键（同国内版口径）：键只取日期前缀，值带精确时刻。
+			Key:    fmt.Sprintf("%s|%s", acct.PackageName, expireDay(acct.CycleEndTime)),
 			Usable: true, // 国际版无端点分区，所有套餐均可被本工具消耗
 		})
 	}
 	return total, items, nil
 }
 
-// expireDate 把上游墙钟时间串（UTC+8）转为 YYYY-MM-DD；缺失/不可解析时返回空串。
+// expireDate 把上游墙钟时间串（UTC+8）转为 **RFC3339 精确时刻**；缺失/不可解析时返回空串。
+//
+// 历史：旧实现返回 "YYYY-MM-DD"，丢了时分秒。面板按「N 小时内到期」分桶需要精确时刻
+// （2026-10-19 实测：按日期桶会把今晚失效的包报成「明日到期」）。
+//
+// ⚠ 伪键不要用本函数（会带时刻）：Key 必须用 expireDay() 取日期前缀，否则升级瞬间
+// 每个包一对 expire+earn 假流水。
 func expireDate(ts string) string {
 	ts = strings.TrimSpace(ts)
 	if ts == "" {
 		return ""
 	}
 	if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, softRateResetLoc); err == nil {
-		return t.Format("2006-01-02")
+		return t.Format(time.RFC3339)
 	}
 	return ""
+}
+
+// expireDay 取到期日的**日期前缀**（"YYYY-MM-DD"），专供 ledger 伪键使用。
+// 与 expireDate() 分开的原因见其注释：键要稳定（不含时刻），值要精确（含时刻）。
+func expireDay(ts string) string {
+	return provider.ExpireDate(expireDate(ts))
 }
 
 // DailyCheckin 国际版的「每日活跃」任务：用免费模型对话一次保持账号活跃，

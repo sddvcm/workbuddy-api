@@ -25,9 +25,21 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
+		// 14018 积分耗尽（workbuddyai 生产实录；本渠道预防性同构特判）：归 hard_credit——
+		// 误判软限流只冷 60s，降级链永不触发。
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs and get more credits: https://www.codebuddy.ai/profile/usage ","requestId":"x"}}}`, ErrHardCredit},
+		// 匹配防前缀误伤（S2）：code 140180 含子串 "code":14018，须保持软限流；
+		// 尾形（code 后紧跟 }，无 msg）是真 14018，须命中。
+		{429, `{"error":{"data":{"code":140180,"msg":"future code"}}}`, ErrSoftRate},
+		{429, `{"error":{"data":{"code":14018}}}`, ErrHardCredit},
+		// 回归：6004 模型级限流 / 14003 过频（构造，未实证）/ 429+quota exceeded 均保持软限流。
+		{429, `{"code":6004,"msg":"usage exceeds frequency limit ... will reset at ..."}`, ErrSoftRate},
+		{429, `{"code":14003,"msg":"too many requests"}`, ErrSoftRate},
+		{429, `quota exceeded`, ErrSoftRate},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 401 统一归登录态失效（#134）：上游拒绝我们的凭据 = 需重新登录
+		{401, `{"code":9999,"msg":"bad token"}`, ErrSessionDead},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
