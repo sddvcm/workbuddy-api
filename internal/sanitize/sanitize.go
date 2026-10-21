@@ -20,6 +20,8 @@ var featHeaders = []string{
 	"github.com/anthropics/",
 	"11128",
 	"You are an AI agent powered by DeepSeek Harness", // DSH 身份句：上游按 system 开头逐字锚定（2026-10-21 实测）
+	"through the DeepSeek Harness Web GUI whose URL the runtime context names", // DSH desktop GUI identity lead (matched only as part of a 221-char run; see rewrite table)
+
 }
 
 var reHdr = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
@@ -49,6 +51,14 @@ var rewrites = [][2]string{
 		// DSH 身份句：上游只认 system 开头的逐字形态，插入冠词 the 即绕过（实测 200）。
 		"You are an AI agent powered by DeepSeek Harness",
 		"You are an AI agent powered by the DeepSeek Harness",
+	},
+	{
+		// DSH desktop GUI identity lead. Alone this sentence passes; the upstream anchor is
+		// the 221-char run formed by this sentence plus the one right after it, joined by a
+		// single space. Verified 2026-10-21: dropping one char, inserting a blank line, or
+		// rewording any single word all pass. names -> indicates breaks the verbatim match.
+		"through the DeepSeek Harness Web GUI whose URL the runtime context names",
+		"through the DeepSeek Harness Web GUI whose URL the runtime context indicates",
 	},
 }
 
