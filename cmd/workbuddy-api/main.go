@@ -594,8 +594,37 @@ func main() {
 	appInst.SetHandler(inner)
 	appInst.SetRootHandler(server.SecurityHeaders(mux, log.Printf))
 
+	// 启动时绑端口失败 = 端口已被占用，直接退出，**不可继续往下跑**。
+	//
+	// 为什么必须 Fatal（2026-10-22 用户报障）：旧实现只 log.Printf 打印警告就继续，
+	// 于是进程照样起来 —— 调度器在跑、日志在刷、托盘图标正常出现（systray 与
+	// listener 无关），但它的 net.Listen 从未成功，是个**没有 HTTP 服务的空壳**。
+	// 用户症状是「进程活着、页面打不开」，且双击托盘打开面板时浏览器访问
+	// 127.0.0.1:port 打到的是**先启动的那个实例**——如果那是升级前的旧版本，
+	// 用户会以为面板坏了，实则眼前这个进程的窗口根本不属于它。极难自查。
+	//
+	// 注意与面板热切换的区分：面板改监听地址走 SetListen→serveLocked，失败时
+	// 由 apiError 回 400 提示，不会走到这里。此处是启动路径，失败即无服务可用，
+	// 继续运行没有意义。
 	if err := appInst.StartServer(); err != nil {
-		log.Printf("listen %s failed: %v（面板中将提示）", cfg.Listen.Addr(), err)
+		log.Printf("listen %s failed: %v", cfg.Listen.Addr(), err)
+		// 端口占用是最常见原因，且几乎必然意味着「已有实例在跑」，单独点明。
+		if isAddrInUse(err) {
+			log.Printf("端口已被占用：地址 %s 已有进程在监听。", cfg.Listen.Addr())
+			log.Printf("本实例不会提供服务，请先退出已运行的实例（托盘菜单「退出」；" +
+				"或任务管理器结束 workbuddy-api.exe / 命令行 taskkill /IM workbuddy-api.exe /F），再重新启动。")
+			// 托盘已起的话给个系统通知，否则静默退出用户看不到任何提示。
+			if !autostart && !noTray {
+				platform.Notify("workbuddy-api 启动失败：端口被占用",
+					fmt.Sprintf("%s 已被另一个 workbuddy-api 实例占用。\n\n"+
+						"请到右下角托盘图标右键「退出」结束已运行的实例，再重新启动本程序。",
+						cfg.Listen.Addr()))
+			}
+		}
+		// 调度器与后台任务此刻尚未启动（sctx 在下方才创建），无需 stop() 取消；
+		// 只停 HTTP 与释放已持有的资源。appInst.Stop 内部走 a.Close 收口。
+		appInst.Stop()
+		os.Exit(1)
 	}
 
 	// 调度器后台运行
@@ -804,6 +833,68 @@ func workDir() string {
 		}
 	}
 	return dir
+}
+
+// Windows 平台的 Winsock 错误码（WSAE*）。
+//
+// ⚠️ **不能用 syscall.EADDRINUSE 判端口占用** —— 实测（2026-10-22，本机 Windows）：
+// net.Listen 端口被占时，错误链最内层的 syscall.Errno 是 **10048**（WSAEADDRINUSE），
+// 而 syscall.EADDRINUSE 常量值是 **536870914**（ERROR_ALREADY_EXISTS）—— 两个毫无关系的码。
+// errors.Is 同样判false（Go 在 Windows 上没把这个 WSAE* 归一到 Errno 的 Is 语义）。
+// 于是「errors.Is(err, syscall.EADDRINUSE)」在 Windows 上恒为假，提示语永远不会出现。
+//
+// Unix 侧则相反：net 包返回的就是 EADDRINUSE(98)，故两套都要认。
+const (
+	wsaeAddrInUse    syscall.Errno = 10048
+	wsaeAddrNotAvail               = 10049
+)
+
+// isAddrInUse 判定 net.Listen 的错误是否为「地址已被占用 / 不可用」。
+//
+// 三个坑，都实测踩过（2026-10-22）：
+//
+//  1. 不能用 strings.Contains(err.Error(), "only one usage") —— 那串文案来自操作系统
+//     的英文原文，Windows 中文版与其他平台措辞不同，会静默漏判。
+//
+//  2. errors.Is(err, syscall.EADDRINUSE) 在 Windows 上判不出来，见上方常量注释。
+//
+//  3. 最内层不是裸 Errno：真实链是 *net.OpError → *os.SyscallError → syscall.Errno，
+//     必须逐层剥到最后再比数值。
+//
+// 附带判定「地址不可用」：绑定到不存在的本地地址（配置了已卸载的网卡 IP）与端口占用
+// 同属「listen 阶段失败、进程无服务可用」，但提示要区分，否则用户会去查端口。
+func isAddrInUse(err error) bool {
+	errno := listenErrno(err)
+	if errno == 0 {
+		return false
+	}
+	switch errno {
+	case syscall.EADDRINUSE, wsaeAddrInUse: // 后者仅 Windows 生效
+		return true
+	case syscall.EADDRNOTAVAIL, wsaeAddrNotAvail: // 后者仅 Windows 生效
+		return true
+	}
+	return false
+}
+
+// listenErrno 从 net.Listen 的错误链剥出最内层的 syscall.Errno，取不到返回 0。
+// 剥不动（有环节不实现 Unwrap）或非 OpError 一律返回 0 —— 宁可漏判也不误报。
+func listenErrno(err error) syscall.Errno {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		return 0
+	}
+	for inner := opErr.Err; inner != nil; {
+		if errno, ok := inner.(syscall.Errno); ok {
+			return errno
+		}
+		u, ok := inner.(interface{ Unwrap() error })
+		if !ok {
+			return 0
+		}
+		inner = u.Unwrap()
+	}
+	return 0
 }
 
 // displayHost 展示用途的主机名。
