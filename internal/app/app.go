@@ -56,7 +56,7 @@ import (
 // （cmd/workbuddy-api/rsrc_windows_amd64.syso，由 build/make_syso.py 从
 // icon.ico 生成）也带版本号，须重新生成 —— 见 build/ICON_README.md。
 // 否则文件属性里显示的还是旧版本，与面板显示不一致。
-const Version = "0.1.5"
+const Version = "0.1.6"
 
 const (
 	loginTimeout   = 5 * time.Minute
